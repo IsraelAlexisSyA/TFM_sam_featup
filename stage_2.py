@@ -234,29 +234,51 @@ for i, similar_image_path in enumerate(rutas_imagenes_similares):  # Usa los pat
 
 print(f"iniciando SAm")
 start_time_sam = time.time()
-import matplotlib
-matplotlib.use('Agg')
-
+# Importamos SAM2AutomaticMaskGenerator
 from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+import cv2
 
-
-# Funciones de visualización (las mismas que en tu código original, solo para referencia)
+# Funciones de visualización (las mismas que en tu código original)
 def show_mask(mask, ax, random_color=False, borders = True):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     else:
         color = np.array([30/255, 144/255, 255/255, 0.6])
     h, w = mask.shape[-2:]
-    mask = mask.astype(np.uint8)
-    mask_image =  mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    
+    # Create a 3-channel image for drawing contours
+    # Initialize a transparent image for the mask itself
+    mask_image_alpha = np.zeros((h, w, 4), dtype=np.float32)
+    mask_image_alpha[mask > 0] = color
+
     if borders:
-        import cv2
-        contours, _ = cv2.findContours(mask,cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        # Try to smooth contours
-        contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
-        mask_image = cv2.drawContours(mask_image, contours, -1, (1, 1, 1, 0.5), thickness=2)
-    ax.imshow(mask_image)
+        # Convert mask to uint8 for findContours
+        mask_uint8 = mask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        
+        # Draw contours on a separate 3-channel image first, then blend
+        # Create a blank 3-channel image to draw contours on
+        contour_image = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # The contour color for cv2.drawContours should be 3 channels (BGR)
+        # Convert (1,1,1) (white) to (255,255,255) for uint8 image
+        cv2.drawContours(contour_image, contours, -1, (255, 255, 255), thickness=2)
+        
+        # Convert contour image to float and normalize to [0,1] for blending
+        contour_image_float = contour_image.astype(np.float32) / 255.0
+        
+        # Blend the contours onto the mask_image_alpha
+        # Create a mask for the contours themselves to apply their color
+        contour_mask = (contour_image_float.sum(axis=-1) > 0).astype(np.float32)
+        
+        # Apply white color to the contour regions in the alpha image
+        # This will make the borders white on the final plot
+        mask_image_alpha[contour_mask > 0, :3] = 1.0 # Set RGB to white
+        mask_image_alpha[contour_mask > 0, 3] = 0.5 # Set alpha for the border
+
+    ax.imshow(mask_image_alpha)
+
 
 def show_points(coords, labels, ax, marker_size=375):
     pos_points = coords[labels==1]
@@ -264,33 +286,41 @@ def show_points(coords, labels, ax, marker_size=375):
     ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
     ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
 
-def save_masks(image, masks, scores, point_coords=None, box_coords=None, input_labels=None, borders=True, output_filename="mask_output.png"):
-    for i, (mask, score) in enumerate(zip(masks, scores)):
-        plt.figure(figsize=(10, 10))
-        plt.imshow(image)
-        show_mask(mask, plt.gca(), borders=borders)
-        if point_coords is not None:
-            assert input_labels is not None
-            show_points(point_coords, input_labels, plt.gca())
-        if len(scores) > 1:
-            plt.title(f"Mask {i+1}, Score: {score:.3f}", fontsize=18)
-        else:
-            plt.title(f"Score: {score:.3f}", fontsize=18)
-        plt.axis('off')
-        
-        # Save the plot to a .png file
-        plt.tight_layout()
-        plt.savefig(output_filename)
-        print(f"Mask plot saved to: {output_filename}")
-        plt.close()
+def show_masks_grid(image, masks, points=None, plot_title="Generated Masks"):
+    """
+    Función adaptada para mostrar múltiples máscaras de un grid de puntos.
+    Muestra todas las máscaras generadas en una sola figura.
+    """
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image)
+    ax = plt.gca()
+    
+    if points is not None:
+        # Los puntos del grid generados automáticamente por SAM2AutomaticMaskGenerator
+        # son siempre positivos (label=1). No necesitamos mostrar negativos aquí.
+        # Creamos labels para visualización.
+        point_labels_for_display = np.ones(points.shape[0], dtype=int)
+        show_points(points, point_labels_for_display, ax, marker_size=50) # Reducimos el tamaño para un grid
 
-checkpoint = "/home/imercatoma/sam2_repo_independent/checkpoints/sam2.1_hiera_large.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    for mask_data in masks:
+        mask = mask_data["segmentation"]
+        show_mask(mask, ax, random_color=True) # Usa colores aleatorios para distinguir máscaras
+    
+    plt.title(plot_title, fontsize=18)
+    plt.axis('off')
+    # Guardar el plot en un archivo en lugar de mostrarlo interactivamente
+    #output_grid_mask_filename = os.path.join(plot_save_directory_on_server, 'sam_grid_masks.png')
+    #plt.savefig(output_grid_mask_filename)
+    #print(f"Plot de máscaras del grid guardado en: {output_grid_mask_filename}")
+    #plt.close()
+
+
+checkpoint = "/home/imercatoma/sam2_repo_independent/checkpoints/sam2.1_hiera_small.pt"
+model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 try:
-    sam2_model = build_sam2(model_cfg, checkpoint, device=device)
-    predictor = SAM2ImagePredictor(sam2_model)
-    print("SAM2 cargado correctamente con SAM2ImagePredictor")
+    sam2_model = build_sam2(model_cfg, checkpoint, device=device, apply_postprocessing=False) # apply_postprocessing=False para AutomaticMaskGenerator
+    print("SAM2 cargado correctamente para Automatic Mask Generation")
 except FileNotFoundError as e:
     print(f"Error: No se encontraron los archivos del modelo SAM2: {e}")
     exit()
@@ -300,58 +330,112 @@ except Exception as e:
     exit()
 
 # Cargar la imagen de consulta para SAM
-# Asegúrate de que 'query_image_path' esté definido y sea accesible
 try:
     image_for_sam = Image.open(query_image_path).convert("RGB")
     image_for_sam_np = np.array(image_for_sam)
+    print(f"Dimensiones imagen de entrada a SAM (np.array(query_img_pil)): {image_for_sam_np.shape}")
 except FileNotFoundError:
     print(f"Error: No se encontró la imagen en la ruta: {query_image_path}")
     exit()
 
-try:
-    predictor.set_image(image_for_sam_np) # Procesa la imagen para obtener los embeddings
-except Exception as e:
-    print("Error al procesar la imagen para SAM:")
-    print(e)
-    exit()
+# --- Parámetros para el grid de puntos ---
+# Puedes ajustar estos valores según la densidad de puntos que desees
+# Se usará 'points_per_side' para definir una cuadrícula cuadrada.
+# Por ejemplo, si pones 16, se generará una cuadrícula de 16x16 puntos.
+points_grid_density = 16 # 16 - 12 etc Número de puntos a lo largo de un lado del grid
 
-# Definir los puntos de entrada para SAM
-# Aquí es donde especificas dos puntos: uno para el objeto y otro para el fondo
-# Ajusta estas coordenadas según el objeto que quieras segmentar en tu imagen de consulta
-# Coordenada del punto para el objeto (etiqueta 1)
-point_coords = np.array([[500, 500], [600, 600]]) # Ejemplo: [y, x] para dos puntos
-# Etiquetas de los puntos: 1 para punto positivo (dentro del objeto), 0 para punto negativo (fuera del objeto)
-point_labels = np.array([1, 1]) # El primer punto es positivo, el segundo es negativo
-
-# Generar la máscara utilizando los puntos
-masks, scores, logits = predictor.predict(
-    point_coords=point_coords,
-    point_labels=point_labels,
-    multimask_output=False, # Genera una sola máscara de salida
+# Inicializar el generador de máscaras automático
+mask_generator = SAM2AutomaticMaskGenerator(
+    model=sam2_model,
+    points_per_side=points_grid_density, # Usamos la variable que definimos
+    points_per_batch=256, # 64 - 256 Número de puntos procesados en cada lote (ajustable según tu GPU)
+    pred_iou_thresh=0.88, # Umbral de confianza para filtrar máscaras
+    stability_score_thresh=0.95, # Umbral de estabilidad para filtrar máscaras
+    crop_n_layers=0, # Desactiva el cropping batch de recorte 
+    #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
+    min_mask_region_area=25.0, # Área mínima de la máscara para filtrar (en píxeles)
 )
 
-# Mostrar la máscara resultante
-# Utilizamos la función show_masks adaptada para mostrar solo los puntos
-output_mask_filename = os.path.join(plot_save_directory_on_server, 'sam_mask_output.png')
-save_masks(image_for_sam_np, masks, scores, point_coords=point_coords, input_labels=point_labels, output_filename=output_mask_filename)
+# CORRECCIÓN AQUÍ: Usamos la variable 'points_grid_density' que contiene el valor
+print(f"Generando máscaras con un grid de {points_grid_density}x{points_grid_density} puntos...")
+
+# Generar máscaras
+masks_data = mask_generator.generate(image_for_sam_np)
+
+print(f"Se generaron {len(masks_data)} máscaras.")
+
+# Extraer los puntos que SAM2AutomaticMaskGenerator usó para generar las máscaras
+# SAM2AutomaticMaskGenerator no retorna directamente el grid completo,
+# sino los puntos que generaron cada máscara. Podemos colectarlos para visualización.
+all_generated_points = []
+for mask_info in masks_data:
+    if "point_coords" in mask_info:
+        all_generated_points.append(mask_info["point_coords"])
+if all_generated_points:
+    all_generated_points = np.concatenate(all_generated_points, axis=0)
+else:
+    all_generated_points = None
+
+# Visualizar las máscaras generadas y los puntos del grid
+show_masks_grid(image_for_sam_np, masks_data, points=all_generated_points, plot_title=f"SAM2 Masks with {points_grid_density}x{points_grid_density} Grid Points")
+# --- Save the query image mask plot with a unique filename ---
+output_query_grid_mask_filename = os.path.join(plot_save_directory_on_server, 'sam_query_image_grid_masks.png')
+plt.savefig(output_query_grid_mask_filename)
+print(f"Plot de máscaras del grid para la imagen de consulta guardado en: {output_query_grid_mask_filename}")
+plt.close() # Close the figure to free memory
+
+
+# --- Aplicando SAM MASK a las imágenes similares ---
+print("\nGenerando y visualizando máscaras SAM para las imágenes similares...")
+
+for i, similar_image_path in enumerate(rutas_imagenes_similares):
+    try:
+        img_similar_pil = Image.open(similar_image_path).convert('RGB')
+        image_np_similar_for_sam = np.array(img_similar_pil)
+
+        print(f"--- Procesando: {os.path.basename(similar_image_path)} ---") # Add a clear separator
+        current_similar_masks_data = mask_generator.generate(image_np_similar_for_sam)
+        print(f"Se generaron {len(current_similar_masks_data)} máscaras para {os.path.basename(similar_image_path)}.")
+
+        all_generated_points_similar = []
+        for mask_info in current_similar_masks_data:
+            if "point_coords" in mask_info:
+                all_generated_points_similar.append(mask_info["point_coords"])
+        if all_generated_points_similar:
+            all_generated_points_similar = np.concatenate(all_generated_points_similar, axis=0)
+        else:
+            all_generated_points_similar = None
+
+        # Call show_masks_grid (it no longer saves the file internally)
+        show_masks_grid(image_np_similar_for_sam, current_similar_masks_data, 
+                        points=all_generated_points_similar, 
+                        plot_title=f"SAM2 Masks - Vecino {i + 1} ({os.path.basename(similar_image_path)})")
+        
+        # --- NOW, SAVE WITH A UNIQUE FILENAME FOR THIS SIMILAR IMAGE ---
+        output_similar_grid_mask_filename = os.path.join(plot_save_directory_on_server, f'sam_similar_image_{i + 1}_grid_masks.png')
+        plt.savefig(output_similar_grid_mask_filename) # Save the plot for this image
+        print(f"Plot de máscaras del grid para el vecino {i + 1} guardado en: {output_similar_grid_mask_filename}")
+        plt.close() # Close the figure after saving and for the next iteration
+
+    except FileNotFoundError:
+        print(f"Advertencia: No se pudo encontrar la imagen similar en la ruta: {similar_image_path}. Omitiendo generación de máscaras para esta imagen.")
+    except Exception as e:
+        print(f"Error al procesar la imagen similar {os.path.basename(similar_image_path)} para la generación de máscaras SAM: {e}")
+
+
+
 
 end_time_sam = time.time()
-print(f"Tiempo de ejecución de SAM: {end_time_sam - start_time_sam:.4f} segundos")
+print(f"Tiempo de ejecución de SAM con grid: {end_time_sam - start_time_sam:.4f} segundos")
 
+
+
+
+
+
+end_time = time.time() # Dummy value
 total_execution_time = (end_time - start_time) + time_knn_dist + (end_time_sam - start_time_sam)
 print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segundos")
 
 
-
-end_time_sam = time.time()
-
-
-
-
-
-
-#end_time = time.time() 
-
-total_execution_time = (end_time - start_time)+(time_knn_dist)
-print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segundos")
 print(f"Finalizado SAm")
