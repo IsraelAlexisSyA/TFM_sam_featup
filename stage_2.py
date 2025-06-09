@@ -363,8 +363,22 @@ print(f"Generando máscaras con un grid de {points_grid_density}x{points_grid_de
 
 # Generar máscaras
 masks_data = mask_generator.generate(image_for_sam_np)
+print(f"Tipo de dato de masks_data: {type(masks_data)}")
+
 
 print(f"Se generaron {len(masks_data)} máscaras.")
+#print(f"Dimensiones mascaras: {masks_data.shape}")
+print(f"Dimensiones de la imagen de entrada a SAM: {image_for_sam_np.shape}")
+# Mostrar información de las máscaras generadas
+for i, mask_info in enumerate(masks_data):
+    print(f"Mascara {i + 1}:")
+    print(f"  - Dimensiones: {mask_info['segmentation'].shape}")
+    print(f"  - Área: {mask_info['area']}")
+    print(f"  - Puntos usados: {mask_info.get('point_coords', 'N/A')}")
+    print(f"  - Etiquetas de puntos: {mask_info.get('point_labels', 'N/A')}")
+    print(f"  - Predicción de IoU: {mask_info.get('predicted_iou', 'N/A')}")
+    print(f"  - Estabilidad: {mask_info.get('stability_score', 'N/A')}\n")
+# --- Visualización de las máscaras generadas ---
 
 # Extraer los puntos que SAM2AutomaticMaskGenerator usó para generar las máscaras
 # SAM2AutomaticMaskGenerator no retorna directamente el grid completo,
@@ -538,10 +552,117 @@ for i, similar_hr_feats in enumerate(similar_hr_feats_list):
 
 print("\nProceso de 'Object Feature Map' completado. ¡Ahora tienes los fobj_q y fobj_r listos!")
 
+## Matching 
+start_time_sam_matching = time.time()
+def apply_global_max_pool(feat_map):
+    # feat_map: (M, C, H, W)
+    return F.adaptive_max_pool2d(feat_map, output_size=1).squeeze(-1).squeeze(-1)  # Resultado: (M, C)
+
+# a. aplica global max pooling a fobj_q
+fobj_q_pooled = apply_global_max_pool(fobj_q)  # (M, 384)
+
+all_fobj_r_pooled_list = []
+for fobj_r_current in all_fobj_r_list:
+    pooled_r = apply_global_max_pool(fobj_r_current)  # (N, 384)
+    all_fobj_r_pooled_list.append(pooled_r)
+# Concatenar todos los fobj_r en un solo tensor
+#fobj_r = torch.cat(all_fobj_r_pooled_list, dim=0)  # (N_total, 384)
+# Ahora fobj_q_pooled y fobj_r están listos para ser usados en la siguiente etapa
+# --- Guardar los resultados de fobj_q y fobj_r ---
+
+# b. normalizar los vectores 
+fobj_q_norm = F.normalize(fobj_q_pooled, p=2, dim=1)  # (M, C)
+
+all_fobj_r_norm_list = [F.normalize(fobj_r_pooled, p=2, dim=1)
+                        for fobj_r_pooled in all_fobj_r_pooled_list]
+
+# c. matching por similitud coseno
+def max_similarities(query_feats, candidate_feats):
+    sim_matrix = torch.mm(query_feats, candidate_feats.T)  # (M, N)
+    max_vals, _ = sim_matrix.max(dim=1)  # (M,) → mejor match para cada objeto de consulta
+    return max_vals
+
+    # c.1. Comparacion de similitudes
+
+sim_vals_list = [max_similarities(fobj_q_norm, r_feats) for r_feats in all_fobj_r_norm_list]
+
+# Mejor similitud de cada objeto en cualquiera de las imágenes similares
+best_similarities = torch.stack(sim_vals_list, dim=1).max(dim=1).values  # (M,)
+
+# d. Deteccion de anomalías
+# umbral para considerar una anomalía
+
+#max_similarities_q = max_similarities(fobj_q_norm, all_fobj_r_norm_list[0])  # (M,)
+threshold = 0.8  # Ajustable según tu aplicación
+anomalies = best_similarities < threshold
+
+if anomalies.any():
+    anomalous_ids = anomalies.nonzero(as_tuple=True)[0]
+    print(f"🔍 Objetos anómalos detectados en índices: {anomalous_ids.tolist()}")
+else:
+    print("✅ Todos los objetos de la imagen de consulta están bien representados en las similares.")
+
+for idx, sim_val in enumerate(best_similarities):
+    estado = "✅ OK" if sim_val >= threshold else "❌ Anómalo"
+    print(f"Objeto {idx}: similitud máxima = {sim_val.item():.4f} → {estado}")
+end_time_sam_matching = time.time()
+print(f"Tiempo para calcular similitudes: {end_time_sam_matching - start_time_sam_matching:.4f} segundos")
+
+
+# e. Visualiacon de anoalias en la query image
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+
+def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5):
+    plt.figure(figsize=(8, 8))
+    plt.imshow(image_np)
+
+    # Colores para anomalías (puedes variar)
+    for i in anomalous_ids:
+        mask = masks[i]
+        if isinstance(mask, torch.Tensor):
+            mask = mask.cpu().numpy()
+        colored_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
+        colored_mask[mask > 0] = [255, 0, 0]  # Rojo
+
+        plt.imshow(colored_mask, alpha=alpha)
+
+    plt.title("Objetos Anómalos en Rojo")
+    plt.axis("off")
+    plt.show()
+    # Guardar el plot en un archivo
+output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies.png')
+plt.tight_layout()
+plt.savefig(output_anomalies_query_plot)
+print(f"Plot de anomalias de la imagen de consulta guardado en: {output_anomalies_query_plot}")
+plt.close()
+
+
+
+anomalous_ids = anomalies.nonzero(as_tuple=True)[0].tolist()
+
+if anomalous_ids:
+    show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_ids)
+else:
+    print("✅ No se detectaron anomalías para visualizar.")
+
+
+
+
+
+
 
 end_time = time.time() # Dummy value
 total_execution_time = (end_time - start_time) + time_knn_dist + (end_time_sam - start_time_sam)
 print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segundos")
 
 
-print(f"Finalizado SAm")
+print(f"Finalizado")
+
+
+
+
+
+
