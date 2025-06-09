@@ -55,12 +55,12 @@ except Exception as e:
 
 
 # Define donde quieres guardar el plot
-plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_output'
-output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_000_plot.png')
+plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_1'
+output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_plot.png')
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/good/000.png'
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/001.png'
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -177,7 +177,6 @@ print(f"Plot de imágenes similares guardado en: {output_similar_plot_filename}"
 plt.close()
 print("Script Stage 2 completado.")
 
-
 # --- 6. Aplicar FeatUp para obtener características de alta resolución ---
 
 def apply_featup_hr(image_path, featup_upsampler, image_transform, device):
@@ -208,7 +207,6 @@ plt.tight_layout()
 plt.savefig(output_query_plot_filename)
 print(f"Plot de características de la imagen de consulta guardado en: {output_query_plot_filename}")
 plt.close()
-
 
 # 6.2 A similares imagenes
 similar_hr_feats_list = []
@@ -344,18 +342,18 @@ except FileNotFoundError:
 # Puedes ajustar estos valores según la densidad de puntos que desees
 # Se usará 'points_per_side' para definir una cuadrícula cuadrada.
 # Por ejemplo, si pones 16, se generará una cuadrícula de 16x16 puntos.
-points_grid_density = 16 # 16 - 12 etc Número de puntos a lo largo de un lado del grid
+points_grid_density = 32 # 16 - 12 etc Número de puntos a lo largo de un lado del grid
 
 # Inicializar el generador de máscaras automático
 mask_generator = SAM2AutomaticMaskGenerator(
     model=sam2_model,
     points_per_side=points_grid_density, # Usamos la variable que definimos
     points_per_batch=256, # 64 - 256 Número de puntos procesados en cada lote (ajustable según tu GPU)
-    pred_iou_thresh=0.88, # Umbral de confianza para filtrar máscaras
-    stability_score_thresh=0.95, # Umbral de estabilidad para filtrar máscaras
+    pred_iou_thresh=0.88, # 0.88 Umbral de confianza para filtrar máscaras
+    stability_score_thresh=0.7, # Umbral de estabilidad para filtrar máscaras
     crop_n_layers=0, # Desactiva el cropping batch de recorte 
     #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
-    min_mask_region_area=25.0, # Área mínima de la máscara para filtrar (en píxeles)
+    min_mask_region_area=100.0, # Área mínima de la máscara para filtrar (en píxeles)
 )
 
 # CORRECCIÓN AQUÍ: Usamos la variable 'points_grid_density' que contiene el valor
@@ -366,10 +364,11 @@ masks_data = mask_generator.generate(image_for_sam_np)
 print(f"Tipo de dato de masks_data: {type(masks_data)}")
 
 
-print(f"Se generaron {len(masks_data)} máscaras.")
+print(f"Se generaron {len(masks_data)} máscaras de consulta.")
 #print(f"Dimensiones mascaras: {masks_data.shape}")
 print(f"Dimensiones de la imagen de entrada a SAM: {image_for_sam_np.shape}")
 # Mostrar información de las máscaras generadas
+"""""
 for i, mask_info in enumerate(masks_data):
     print(f"Mascara {i + 1}:")
     print(f"  - Dimensiones: {mask_info['segmentation'].shape}")
@@ -378,6 +377,7 @@ for i, mask_info in enumerate(masks_data):
     print(f"  - Etiquetas de puntos: {mask_info.get('point_labels', 'N/A')}")
     print(f"  - Predicción de IoU: {mask_info.get('predicted_iou', 'N/A')}")
     print(f"  - Estabilidad: {mask_info.get('stability_score', 'N/A')}\n")
+"""""
 # --- Visualización de las máscaras generadas ---
 
 # Extraer los puntos que SAM2AutomaticMaskGenerator usó para generar las máscaras
@@ -411,9 +411,10 @@ for i, similar_image_path in enumerate(rutas_imagenes_similares):
 
         print(f"--- Procesando: {os.path.basename(similar_image_path)} ---") # Add a clear separator
         current_similar_masks_data = mask_generator.generate(image_np_similar_for_sam)
+        print(f"Se generaron {len(current_similar_masks_data)} máscaras para la imagen similar {i + 1}.")
         similar_masks_raw_list.append(current_similar_masks_data) # Guardar las máscaras generadas para esta imagen
         print(f"Dimensiones imagen similar para SAM (np.array): {image_np_similar_for_sam.shape}")
-        print(f"Se generaron {len(current_similar_masks_data)} máscaras para {os.path.basename(similar_image_path)}.")
+        #print(f"Se generaron {len(current_similar_masks_data)} máscaras para {os.path.basename(similar_image_path)}.")
 
         all_generated_points_similar = []
         for mask_info in current_similar_masks_data:
@@ -614,43 +615,42 @@ print(f"Tiempo para calcular similitudes: {end_time_sam_matching - start_time_sa
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+import os
 
-def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5):
+def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5, save_path=None):
     plt.figure(figsize=(8, 8))
     plt.imshow(image_np)
 
-    # Colores para anomalías (puedes variar)
     for i in anomalous_ids:
-        mask = masks[i]
+        # Extraer la máscara binaria real
+        mask = masks[i]['segmentation']
         if isinstance(mask, torch.Tensor):
             mask = mask.cpu().numpy()
+        # Crear máscara en rojo
         colored_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
-        colored_mask[mask > 0] = [255, 0, 0]  # Rojo
+        colored_mask[mask > 0] = [255, 0, 0]
 
         plt.imshow(colored_mask, alpha=alpha)
 
     plt.title("Objetos Anómalos en Rojo")
     plt.axis("off")
-    plt.show()
-    # Guardar el plot en un archivo
-output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies.png')
-plt.tight_layout()
-plt.savefig(output_anomalies_query_plot)
-print(f"Plot de anomalias de la imagen de consulta guardado en: {output_anomalies_query_plot}")
-plt.close()
 
+    if save_path:
+        plt.tight_layout()
+        plt.savefig(save_path)
+        print(f"✅ Plot de anomalías guardado en: {save_path}")
+
+    plt.show()
+    plt.close()
 
 
 anomalous_ids = anomalies.nonzero(as_tuple=True)[0].tolist()
 
 if anomalous_ids:
-    show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_ids)
+    output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_2.png')
+    show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_ids, alpha=0.5, save_path=output_anomalies_query_plot)
 else:
     print("✅ No se detectaron anomalías para visualizar.")
-
-
-
-
 
 
 
@@ -660,9 +660,3 @@ print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segu
 
 
 print(f"Finalizado")
-
-
-
-
-
-
