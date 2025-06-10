@@ -319,7 +319,7 @@ checkpoint = "/home/imercatoma/sam2_repo_independent/checkpoints/sam2.1_hiera_sm
 model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 try:
-    sam2_model = build_sam2(model_cfg, checkpoint, device=device, apply_postprocessing=False) # apply_postprocessing=False para AutomaticMaskGenerator
+    sam2_model = build_sam2(model_cfg, checkpoint, device=device, apply_postprocessing=True) # apply_postprocessing=False para AutomaticMaskGenerator
     print("SAM2 cargado correctamente para Automatic Mask Generation")
 except FileNotFoundError as e:
     print(f"Error: No se encontraron los archivos del modelo SAM2: {e}")
@@ -342,18 +342,18 @@ except FileNotFoundError:
 # Puedes ajustar estos valores según la densidad de puntos que desees
 # Se usará 'points_per_side' para definir una cuadrícula cuadrada.
 # Por ejemplo, si pones 16, se generará una cuadrícula de 16x16 puntos.
-points_grid_density = 32 # 16 - 12 etc Número de puntos a lo largo de un lado del grid
+points_grid_density = 16 # 16 - 12 etc Número de puntos a lo largo de un lado del grid
 
 # Inicializar el generador de máscaras automático
 mask_generator = SAM2AutomaticMaskGenerator(
     model=sam2_model,
     points_per_side=points_grid_density, # Usamos la variable que definimos
     points_per_batch=256, # 64 - 256 Número de puntos procesados en cada lote (ajustable según tu GPU)
-    pred_iou_thresh=0.88, # 0.88 Umbral de confianza para filtrar máscaras
-    stability_score_thresh=0.7, # Umbral de estabilidad para filtrar máscaras
+    pred_iou_thresh=0.4, # 0.88 Umbral de confianza para filtrar máscaras
+    stability_score_thresh=0.8, # Umbral de estabilidad para filtrar máscaras
     crop_n_layers=0, # Desactiva el cropping batch de recorte 
     #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
-    min_mask_region_area=100.0, # Área mínima de la máscara para filtrar (en píxeles)
+    min_mask_region_area=2000.0, # Área mínima de la máscara para filtrar (en píxeles)
 )
 
 # CORRECCIÓN AQUÍ: Usamos la variable 'points_grid_density' que contiene el valor
@@ -368,7 +368,7 @@ print(f"Se generaron {len(masks_data)} máscaras de consulta.")
 #print(f"Dimensiones mascaras: {masks_data.shape}")
 print(f"Dimensiones de la imagen de entrada a SAM: {image_for_sam_np.shape}")
 # Mostrar información de las máscaras generadas
-"""""
+
 for i, mask_info in enumerate(masks_data):
     print(f"Mascara {i + 1}:")
     print(f"  - Dimensiones: {mask_info['segmentation'].shape}")
@@ -377,7 +377,7 @@ for i, mask_info in enumerate(masks_data):
     print(f"  - Etiquetas de puntos: {mask_info.get('point_labels', 'N/A')}")
     print(f"  - Predicción de IoU: {mask_info.get('predicted_iou', 'N/A')}")
     print(f"  - Estabilidad: {mask_info.get('stability_score', 'N/A')}\n")
-"""""
+
 # --- Visualización de las máscaras generadas ---
 
 # Extraer los puntos que SAM2AutomaticMaskGenerator usó para generar las máscaras
@@ -566,10 +566,6 @@ all_fobj_r_pooled_list = []
 for fobj_r_current in all_fobj_r_list:
     pooled_r = apply_global_max_pool(fobj_r_current)  # (N, 384)
     all_fobj_r_pooled_list.append(pooled_r)
-# Concatenar todos los fobj_r en un solo tensor
-#fobj_r = torch.cat(all_fobj_r_pooled_list, dim=0)  # (N_total, 384)
-# Ahora fobj_q_pooled y fobj_r están listos para ser usados en la siguiente etapa
-# --- Guardar los resultados de fobj_q y fobj_r ---
 
 # b. normalizar los vectores 
 fobj_q_norm = F.normalize(fobj_q_pooled, p=2, dim=1)  # (M, C)
@@ -593,8 +589,9 @@ best_similarities = torch.stack(sim_vals_list, dim=1).max(dim=1).values  # (M,)
 # d. Deteccion de anomalías
 # umbral para considerar una anomalía
 
-#max_similarities_q = max_similarities(fobj_q_norm, all_fobj_r_norm_list[0])  # (M,)
-threshold = 0.8  # Ajustable según tu aplicación
+###################################
+# max_similarities_q = max_similarities(fobj_q_norm, all_fobj_r_norm_list[0])  # (M,)
+threshold = 0.89  # Ajustable según tu aplicación
 anomalies = best_similarities < threshold
 
 if anomalies.any():
@@ -626,11 +623,19 @@ def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5, save_path
         mask = masks[i]['segmentation']
         if isinstance(mask, torch.Tensor):
             mask = mask.cpu().numpy()
+
         # Crear máscara en rojo
         colored_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
         colored_mask[mask > 0] = [255, 0, 0]
-
         plt.imshow(colored_mask, alpha=alpha)
+
+        # Calcular centroide para colocar el índice
+        ys, xs = np.where(mask > 0)
+        if len(xs) > 0 and len(ys) > 0:
+            cx = int(xs.mean())
+            cy = int(ys.mean())
+            plt.text(cx, cy, str(i), color='white', fontsize=12, fontweight='bold', ha='center', va='center',
+                     bbox=dict(facecolor='red', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
 
     plt.title("Objetos Anómalos en Rojo")
     plt.axis("off")
@@ -644,10 +649,11 @@ def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5, save_path
     plt.close()
 
 
+
 anomalous_ids = anomalies.nonzero(as_tuple=True)[0].tolist()
 
 if anomalous_ids:
-    output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_2.png')
+    output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_4.png')
     show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_ids, alpha=0.5, save_path=output_anomalies_query_plot)
 else:
     print("✅ No se detectaron anomalías para visualizar.")
