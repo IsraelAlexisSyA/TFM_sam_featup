@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import os
 from PIL import Image
@@ -60,7 +61,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/008.png'
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/000.png'
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -353,7 +354,7 @@ mask_generator = SAM2AutomaticMaskGenerator(
     stability_score_thresh=0.7, # 0.8 Umbral de estabilidad para filtrar máscaras
     crop_n_layers=0, # Desactiva el cropping batch de recorte 
     #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
-    min_mask_region_area=1000.0, # Área mínima de la máscara para filtrar (en píxeles)
+    min_mask_region_area=100.0, # Área mínima de la máscara para filtrar (en píxeles)
 )
 
 # CORRECCIÓN AQUÍ: Usamos la variable 'points_grid_density' que contiene el valor
@@ -552,82 +553,12 @@ for i, similar_hr_feats in enumerate(similar_hr_feats_list):
     print(f"Dimensiones de fobj_r para vecino {i+1}: {fobj_r_current.shape}") # Esperado (N, 384, 128, 128)
 
 print("\nProceso de 'Object Feature Map' completado. ¡Ahora tienes los fobj_q y fobj_r listos!")
-
-## Matching 
-start_time_sam_matching = time.time()
-def apply_global_max_pool(feat_map):
-    # feat_map: (M, C, H, W)
-    return F.adaptive_max_pool2d(feat_map, output_size=1).squeeze(-1).squeeze(-1)  # Resultado: (M, C)
-
-# a. aplica global max pooling a fobj_q
-fobj_q_pooled = apply_global_max_pool(fobj_q)  # (M, 384)
-
-all_fobj_r_pooled_list = []
-for fobj_r_current in all_fobj_r_list:
-    pooled_r = apply_global_max_pool(fobj_r_current)  # (N, 384)
-    all_fobj_r_pooled_list.append(pooled_r)
-
-# b. normalizar los vectores 
-fobj_q_norm = F.normalize(fobj_q_pooled, p=2, dim=1)  # (M, C)
-
-all_fobj_r_norm_list = [F.normalize(fobj_r_pooled, p=2, dim=1)
-                        for fobj_r_pooled in all_fobj_r_pooled_list]
-
-# c. matching por similitud coseno
-def max_similarities(query_feats, candidate_feats):
-    sim_matrix = torch.mm(query_feats, candidate_feats.T)  # (M, N)
-    max_vals, _ = sim_matrix.max(dim=1)  # (M,) → mejor match para cada objeto de consulta
-    return max_vals
-
-    # c.1. Comparacion de similitudes
-
-sim_vals_list = [max_similarities(fobj_q_norm, r_feats) for r_feats in all_fobj_r_norm_list]
-
-# Mejor similitud de cada objeto en cualquiera de las imágenes similares
-best_similarities = torch.stack(sim_vals_list, dim=1).max(dim=1).values  # (M,)
-
-# d. Deteccion de anomalías
-# umbral para considerar una anomalía
-
-###################################
-# max_similarities_q = max_similarities(fobj_q_norm, all_fobj_r_norm_list[0])  # (M,)
-threshold = 0.83  # Ajustable según tu aplicación
-anomalies = best_similarities < threshold
-
-if anomalies.any():
-    anomalous_ids = anomalies.nonzero(as_tuple=True)[0]
-    print(f"🔍 Objetos anómalos detectados en índices: {anomalous_ids.tolist()}")
-else:
-    print("✅ Todos los objetos de la imagen de consulta están bien representados en las similares.")
-
-for idx, sim_val in enumerate(best_similarities):
-    estado = "✅ OK" if sim_val >= threshold else "❌ Anómalo"
-    print(f"Objeto {idx}: similitud máxima = {sim_val.item():.4f} → {estado}")
-end_time_sam_matching = time.time()
-print(f"Tiempo para calcular similitudes: {end_time_sam_matching - start_time_sam_matching:.4f} segundos")
-
-
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
-import os
-import torch # Make sure torch is imported if it's used elsewhere for tensor checks
-
-# MODIFIED FUNCTION SIGNATURE AND PLOTTING LOGIC
+  
+# -----------3.5.2 Object matching module-----------------
+## Matching
+# --- Definición de la función show_anomalies_on_image ---
 def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_path=None):
-    """
-    Muestra las anomalías en la imagen, resaltándolas en rojo,
-    y mostrando su índice y porcentaje de similitud.
 
-    Args:
-        image_np (np.array): La imagen base como un array de NumPy.
-        masks (list): Una lista de diccionarios de máscaras, donde cada diccionario
-                      contiene la segmentación binaria.
-        anomalous_info (list of tuple): Lista de tuplas (id_objeto, similitud_maxima).
-                                        Contiene información solo para objetos anómalos.
-        alpha (float): Transparencia de la máscara roja.
-        save_path (str, optional): Ruta para guardar la imagen del plot.
-    """
     plt.figure(figsize=(8, 8))
     plt.imshow(image_np)
 
@@ -663,37 +594,259 @@ def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_pat
 
     plt.show()
     plt.close()
+# --- Fin de la definición de la función show_anomalies_on_image ---
+# --- Nuevas funciones de ploteo para la matriz P y P_augmented_full ---
+def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=None, title="Matriz de Asignación P"):
+    """
+    Visualiza la matriz de asignación P como un mapa de calor.
+
+    Args:
+        P_matrix (torch.Tensor or np.array): La matriz de asignación (M x N).
+        query_labels (list): Etiquetas para los objetos de consulta (eje Y).
+        reference_labels (list): Etiquetas para los objetos de referencia (eje X).
+        save_path (str, optional): Ruta para guardar la imagen del plot.
+        title (str): Título del plot.
+    """
+    if isinstance(P_matrix, torch.Tensor):
+        #P_matrix = P_matrix.cpu().numpy()
+        P_matrix = P_matrix.detach().cpu().numpy()
+
+    plt.figure(figsize=(P_matrix.shape[1] * 0.8 + 2, P_matrix.shape[0] * 0.8 + 2))
+    plt.imshow(P_matrix, cmap='viridis', origin='upper', aspect='auto')
+    plt.colorbar(label='Probabilidad de Asignación')
+    plt.xticks(np.arange(len(reference_labels)), reference_labels, rotation=45, ha="right")
+    plt.yticks(np.arange(len(query_labels)), query_labels)
+    plt.xlabel('Objetos de Referencia')
+    plt.ylabel('Objetos de Consulta')
+    plt.title(title)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+        print(f"✅ Plot de la matriz de asignación guardado en: {save_path}")
+    plt.show()
+    plt.close()
+
+def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_labels, save_path=None, title="Matriz de Asignación Aumentada (con Trash Bin)"):
+    """
+    Visualiza la matriz de asignación aumentada (incluyendo los trash bins) como un mapa de calor.
+
+    Args:
+        P_augmented_full (torch.Tensor or np.array): La matriz de asignación aumentada ((M+1) x (N+1)).
+        query_labels (list): Etiquetas para los objetos de consulta.
+        reference_labels (list): Etiquetas para los objetos de referencia.
+        save_path (str, optional): Ruta para guardar la imagen del plot.
+        title (str): Título del plot.
+    """
+    if isinstance(P_augmented_full, torch.Tensor):
+        #P_augmented_full = P_augmented_full.cpu().numpy()
+        P_augmented_full = P_augmented_full.detach().cpu().numpy()
+
+    # Añadir etiquetas para los trash bins
+    full_query_labels = [f"Q_{i}" for i in query_labels] + ["Trash Bin (Q)"]
+    full_reference_labels = [f"R_{i}" for i in reference_labels] + ["Trash Bin (R)"]
+
+    plt.figure(figsize=(P_augmented_full.shape[1] * 0.8 + 2, P_augmented_full.shape[0] * 0.8 + 2))
+    plt.imshow(P_augmented_full, cmap='viridis', origin='upper', aspect='auto')
+    plt.colorbar(label='Probabilidad de Asignación')
+    plt.xticks(np.arange(len(full_reference_labels)), full_reference_labels, rotation=45, ha="right")
+    plt.yticks(np.arange(len(full_query_labels)), full_query_labels)
+    plt.xlabel('Objetos de Referencia y Trash Bin')
+    plt.ylabel('Objetos de Consulta y Trash Bin')
+    plt.title(title)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+        print(f"✅ Plot de la matriz de asignación aumentada guardado en: {save_path}")
+    plt.show()
+    plt.close()
+
+# --- Fin de las nuevas funciones de ploteo ---
+
+## Matching-continue---
+## Matching
+start_time_sam_matching = time.time()
+def apply_global_max_pool(feat_map):
+    return F.adaptive_max_pool2d(feat_map, output_size=1).squeeze(-1).squeeze(-1)
+
+fobj_q_pooled = apply_global_max_pool(fobj_q)
+
+all_fobj_r_pooled_list = []
+for fobj_r_current in all_fobj_r_list:
+    pooled_r = apply_global_max_pool(fobj_r_current)
+    all_fobj_r_pooled_list.append(pooled_r)
+
+fobj_q_norm = F.normalize(fobj_q_pooled, p=2, dim=1)
+
+all_fobj_r_norm_list = [F.normalize(fobj_r_pooled, p=2, dim=1)
+                        for fobj_r_pooled in all_fobj_r_pooled_list]
+
+def max_similarities(query_feats, candidate_feats):
+    sim_matrix = torch.mm(query_feats, candidate_feats.T)
+    max_vals, _ = sim_matrix.max(dim=1)
+    return max_vals
+
+# --- Optimal Matching Module ---
+class ObjectMatchingModule(nn.Module):
+    def __init__(self, superglue_weights_path=None, sinkhorn_iterations=100, sinkhorn_epsilon=0.1):
+        super(ObjectMatchingModule, self).__init__()
+        self.sinkhorn_iterations = sinkhorn_iterations
+        self.sinkhorn_epsilon = sinkhorn_epsilon
+
+        if superglue_weights_path and os.path.exists(superglue_weights_path):
+            try:
+                state_dict = torch.load(superglue_weights_path, map_location=device)
+                if 'bin_score' in state_dict:
+                    z_value = state_dict['bin_score'].item()
+                elif 'match_model.bin_score' in state_dict:
+                    z_value = state_dict['match_model.bin_score'].item()
+                else:
+                    print(f"Advertencia: 'z' (bin_score) no encontrado en {superglue_weights_path}. Inicializando con valor predeterminado.")
+                    z_value = 0.5
+                
+                self.z = nn.Parameter(torch.tensor(z_value, dtype=torch.float32))
+                print(f"Parámetro 'z' cargado de SuperGlue: {self.z.item():.4f}")
+
+            except Exception as e:
+                print(f"Error al cargar 'z' de {superglue_weights_path}: {e}")
+                self.z = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        else:
+            print(f"Advertencia: superglue_weights_path no válido o no encontrado: {superglue_weights_path}. Inicializando 'z' con valor predeterminado.")
+            self.z = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+
+    def forward(self, d_M_q, d_N_r):
+        M = d_M_q.shape[0]
+        N = d_N_r.shape[0]
+
+        if M == 0 or N == 0:
+            print(f"Matrices de entrada vacías (M={M}, N={N}). Devolviendo matrices de coincidencia vacías.")
+            return torch.empty(M, N, device=d_M_q.device), \
+                   torch.empty(M+1, N+1, device=d_M_q.device)
+
+        score_matrix = torch.mm(d_M_q, d_N_r.T)
+        print(f"Matriz de similitud inicial (MxN): {score_matrix.shape}")
+        # print("score_matrix:\n", score_matrix) # Descomentar para ver la matriz
+
+        S_augmented = torch.zeros((M + 1, N + 1), device=d_M_q.device, dtype=d_M_q.dtype)
+        S_augmented[:M, :N] = score_matrix
+        S_augmented[:M, N] = self.z # Última columna (trash bin para query)
+        S_augmented[M, :N] = self.z # Última fila (trash bin para reference)
+        S_augmented[M, N] = self.z # Esquina inferior derecha (trash bin vs trash bin)
+        print(f"Matriz S_augmented (M+1 x N+1): {S_augmented.shape}")
+        # print("S_augmented:\n", S_augmented) # Descomentar para ver la matriz
+
+        K = torch.exp(S_augmented / self.sinkhorn_epsilon)
+        # print("K (exp(S/epsilon)) antes de Sinkhorn:\n", K) # Descomentar para ver
+
+        for i in range(self.sinkhorn_iterations):
+            K = K / K.sum(dim=1, keepdim=True) # Normalizar filas
+            K = K / K.sum(dim=0, keepdim=True) # Normalizar columnas
+            # print(f"K después de iteración {i+1} de Sinkhorn:\n", K) # Descomentar para ver cada iteración
+
+        P_augmented_full = K
+        P = P_augmented_full[:M, :N] # La matriz de asignación sin trash bins
+        print(f"Matriz de asignación P (MxN): {P.shape}")
+        print("P:\n", P) # Print de la matriz de asignación P
+        print(f"Matriz de asignación P_augmented_full (M+1 x N+1): {P_augmented_full.shape}")
+        print("P_augmented_full:\n", P_augmented_full) # Print de la matriz de asignación completa
+
+        return P, P_augmented_full
+
+# --- Uso del módulo de coincidencia ---
+superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"
+
+object_matching_module = ObjectMatchingModule(
+    superglue_weights_path=superglue_weights_path,
+    sinkhorn_iterations=100,
+    sinkhorn_epsilon=0.1
+).to(device)
+
+P_matrices = []
+P_augmented_full_matrices = []
+
+# Obtener etiquetas para los plots de la matriz
+query_obj_labels = [f"obj_{i}" for i in range(fobj_q_norm.shape[0])]
+
+for i, d_N_r_current_image in enumerate(all_fobj_r_norm_list): # Cambié el nombre para mayor claridad
+    d_M_q = fobj_q_norm.to(device) # Aseguramos que fobj_q_norm esté en el dispositivo correcto
+    d_N_r_current_image = d_N_r_current_image.to(device)
+
+    print(f"\n--- Procesando coincidencia para imagen de referencia {i+1} ---")
+    P_current, P_augmented_current = object_matching_module(d_M_q, d_N_r_current_image)
+    P_matrices.append(P_current)
+    P_augmented_full_matrices.append(P_augmented_current)
+    print(f"Coincidencia para imagen de referencia {i+1} completada.")
+
+    # Generar etiquetas para los objetos de referencia de la imagen actual
+    current_ref_obj_labels = [f"obj_{j}" for j in range(d_N_r_current_image.shape[0])]
+
+    # Plotear la matriz P (sin trash bin)
+    output_p_matrix_filename = os.path.join(plot_save_directory_on_server, f'assignment_matrix_P_ref_{i+1}.png')
+    plot_assignment_matrix(P_current, query_obj_labels, current_ref_obj_labels,
+                           save_path=output_p_matrix_filename,
+                           title=f"Matriz de Asignación (Query vs. Ref {i+1})")
+
+    # Plotear la matriz P_augmented_full (con trash bin)
+    output_p_augmented_filename = os.path.join(plot_save_directory_on_server, f'augmented_assignment_matrix_ref_{i+1}.png')
+    plot_augmented_assignment_matrix(P_augmented_current, query_obj_labels, current_ref_obj_labels,
+                                     save_path=output_p_augmented_filename,
+                                     title=f"Matriz de Asignación Aumentada (Query vs. Ref {i+1})")
 
 
-# --- PREPARE ANOMALOUS_INFO_FOR_PLOT BEFORE CALLING THE FUNCTION ---
-# This part assumes you have 'best_similarities' and 'threshold' defined from your anomaly detection logic.
-# If 'anomalies' is already a boolean tensor, you can use it.
+# --- Lógica de Detección de Anomalías ---
+M = fobj_q_norm.shape[0]
 
-anomalous_info_for_plot = []
-# Assuming 'best_similarities' is a torch.Tensor of similarity values for each object
-# and 'threshold' is the anomaly detection threshold.
-# 'masks_data' and 'image_for_sam_np' should also be defined from your previous steps.
+is_matched_to_real_object = torch.zeros(M, dtype=torch.bool, device=device)
+best_match_confidence_overall = torch.full((M,), -1.0, device=device)
+best_match_to_trash_bin_confidence = torch.full((M,), -1.0, device=device)
 
-for idx, sim_val in enumerate(best_similarities):
-    if sim_val < threshold: # Check if the object is anomalous
-        anomalous_info_for_plot.append((idx, sim_val.item())) # Add (object_id, similarity_value)
+anomaly_detection_threshold = 0.19 # Umbral de detección de anomalías
 
-if anomalous_info_for_plot:
-    output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_18.png') # Changed filename for distinction
-    show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info_for_plot, alpha=0.5, save_path=output_anomalies_query_plot)
-else:
-    print("✅ No se detectaron anomalías para visualizar.")
+for P_current, P_augmented_current in zip(P_matrices, P_augmented_full_matrices):
+    if P_current.shape[0] == 0: continue
 
-# Ensure 'start_time', 'time_knn_dist', and 'end_time_sam' are defined in your broader script
-# For standalone execution, these might need dummy values or proper initialization.
-# Example dummy values if running only this snippet:
-# start_time = time.time() - 10 # Placeholder for a time in the past
-# time_knn_dist = 0.5
-# end_time_sam = time.time() - 2 # Placeholder for a recent time
+    M_current, N_current = P_current.shape
 
-# end_time calculation should be the current time when you reach this point
+    max_conf_to_real_ref, _ = P_current.max(dim=1)
+
+    conf_to_trash_bin_current = P_augmented_current[:M_current, N_current]
+
+    for q_idx in range(M_current):
+        if max_conf_to_real_ref[q_idx] > best_match_confidence_overall[q_idx]:
+            best_match_confidence_overall[q_idx] = max_conf_to_real_ref[q_idx]
+
+        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]:
+             best_match_to_trash_bin_confidence[q_idx] = conf_to_trash_bin_current[q_idx]
+
+        if max_conf_to_real_ref[q_idx] > anomaly_detection_threshold and \
+           max_conf_to_real_ref[q_idx] > conf_to_trash_bin_current[q_idx]:
+            is_matched_to_real_object[q_idx] = True
+
+anomalies_final = ~is_matched_to_real_object
+
+anomalous_ids = anomalies_final.nonzero(as_tuple=True)[0].tolist()
+anomalous_info = []
+for idx in anomalous_ids:
+    anomalous_info.append((idx, best_match_confidence_overall[idx].item())) # Incluir la mejor similitud real
+    print(f"Objeto {idx} es anómalo. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
+
+
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_000.png')
+
+# Aquí también, pasamos la imagen original `image_for_sam_np`
+show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
+print(f"Plot de anomalías guardado en: {output_anomalies_query_plot_om}")
+
+
+
+
+
+
+
 end_time = time.time()
 total_execution_time = (end_time - start_time) + time_knn_dist + (end_time_sam - start_time_sam)
 print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segundos")
 
 print(f"Finalizado")
+
+
+
