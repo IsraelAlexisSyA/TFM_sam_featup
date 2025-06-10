@@ -60,7 +60,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/001.png'
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/008.png'
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -349,11 +349,11 @@ mask_generator = SAM2AutomaticMaskGenerator(
     model=sam2_model,
     points_per_side=points_grid_density, # Usamos la variable que definimos
     points_per_batch=256, # 64 - 256 Número de puntos procesados en cada lote (ajustable según tu GPU)
-    pred_iou_thresh=0.4, # 0.88 Umbral de confianza para filtrar máscaras
-    stability_score_thresh=0.8, # Umbral de estabilidad para filtrar máscaras
+    pred_iou_thresh=0.4, # 0.4  0.88 Umbral de confianza para filtrar máscaras
+    stability_score_thresh=0.7, # 0.8 Umbral de estabilidad para filtrar máscaras
     crop_n_layers=0, # Desactiva el cropping batch de recorte 
     #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
-    min_mask_region_area=2000.0, # Área mínima de la máscara para filtrar (en píxeles)
+    min_mask_region_area=1000.0, # Área mínima de la máscara para filtrar (en píxeles)
 )
 
 # CORRECCIÓN AQUÍ: Usamos la variable 'points_grid_density' que contiene el valor
@@ -591,7 +591,7 @@ best_similarities = torch.stack(sim_vals_list, dim=1).max(dim=1).values  # (M,)
 
 ###################################
 # max_similarities_q = max_similarities(fobj_q_norm, all_fobj_r_norm_list[0])  # (M,)
-threshold = 0.89  # Ajustable según tu aplicación
+threshold = 0.83  # Ajustable según tu aplicación
 anomalies = best_similarities < threshold
 
 if anomalies.any():
@@ -607,20 +607,33 @@ end_time_sam_matching = time.time()
 print(f"Tiempo para calcular similitudes: {end_time_sam_matching - start_time_sam_matching:.4f} segundos")
 
 
-# e. Visualiacon de anoalias en la query image
-
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 import os
+import torch # Make sure torch is imported if it's used elsewhere for tensor checks
 
-def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5, save_path=None):
+# MODIFIED FUNCTION SIGNATURE AND PLOTTING LOGIC
+def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_path=None):
+    """
+    Muestra las anomalías en la imagen, resaltándolas en rojo,
+    y mostrando su índice y porcentaje de similitud.
+
+    Args:
+        image_np (np.array): La imagen base como un array de NumPy.
+        masks (list): Una lista de diccionarios de máscaras, donde cada diccionario
+                      contiene la segmentación binaria.
+        anomalous_info (list of tuple): Lista de tuplas (id_objeto, similitud_maxima).
+                                        Contiene información solo para objetos anómalos.
+        alpha (float): Transparencia de la máscara roja.
+        save_path (str, optional): Ruta para guardar la imagen del plot.
+    """
     plt.figure(figsize=(8, 8))
     plt.imshow(image_np)
 
-    for i in anomalous_ids:
+    for obj_id, similarity in anomalous_info: # Iterate through (id, similarity) tuples
         # Extraer la máscara binaria real
-        mask = masks[i]['segmentation']
+        mask = masks[obj_id]['segmentation']
         if isinstance(mask, torch.Tensor):
             mask = mask.cpu().numpy()
 
@@ -629,15 +642,18 @@ def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5, save_path
         colored_mask[mask > 0] = [255, 0, 0]
         plt.imshow(colored_mask, alpha=alpha)
 
-        # Calcular centroide para colocar el índice
+        # Calcular centroide para colocar el texto
         ys, xs = np.where(mask > 0)
         if len(xs) > 0 and len(ys) > 0:
             cx = int(xs.mean())
             cy = int(ys.mean())
-            plt.text(cx, cy, str(i), color='white', fontsize=12, fontweight='bold', ha='center', va='center',
-                     bbox=dict(facecolor='red', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
+            
+            # Create text with index and percentage
+            text_label = f"{obj_id} ({similarity*100:.2f}%)"
+            plt.text(cx, cy, text_label, color='white', fontsize=10, fontweight='bold', ha='center', va='center',
+                     bbox=dict(facecolor='red', alpha=0.6, edgecolor='none', boxstyle='round,pad=0.2'))
 
-    plt.title("Objetos Anómalos en Rojo")
+    plt.title("Objetos Anómalos en Rojo con Índice y Similitud") # Updated title for clarity
     plt.axis("off")
 
     if save_path:
@@ -649,20 +665,35 @@ def show_anomalies_on_image(image_np, masks, anomalous_ids, alpha=0.5, save_path
     plt.close()
 
 
+# --- PREPARE ANOMALOUS_INFO_FOR_PLOT BEFORE CALLING THE FUNCTION ---
+# This part assumes you have 'best_similarities' and 'threshold' defined from your anomaly detection logic.
+# If 'anomalies' is already a boolean tensor, you can use it.
 
-anomalous_ids = anomalies.nonzero(as_tuple=True)[0].tolist()
+anomalous_info_for_plot = []
+# Assuming 'best_similarities' is a torch.Tensor of similarity values for each object
+# and 'threshold' is the anomaly detection threshold.
+# 'masks_data' and 'image_for_sam_np' should also be defined from your previous steps.
 
-if anomalous_ids:
-    output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_4.png')
-    show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_ids, alpha=0.5, save_path=output_anomalies_query_plot)
+for idx, sim_val in enumerate(best_similarities):
+    if sim_val < threshold: # Check if the object is anomalous
+        anomalous_info_for_plot.append((idx, sim_val.item())) # Add (object_id, similarity_value)
+
+if anomalous_info_for_plot:
+    output_anomalies_query_plot = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_18.png') # Changed filename for distinction
+    show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info_for_plot, alpha=0.5, save_path=output_anomalies_query_plot)
 else:
     print("✅ No se detectaron anomalías para visualizar.")
 
+# Ensure 'start_time', 'time_knn_dist', and 'end_time_sam' are defined in your broader script
+# For standalone execution, these might need dummy values or proper initialization.
+# Example dummy values if running only this snippet:
+# start_time = time.time() - 10 # Placeholder for a time in the past
+# time_knn_dist = 0.5
+# end_time_sam = time.time() - 2 # Placeholder for a recent time
 
-
-end_time = time.time() # Dummy value
+# end_time calculation should be the current time when you reach this point
+end_time = time.time()
 total_execution_time = (end_time - start_time) + time_knn_dist + (end_time_sam - start_time_sam)
 print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segundos")
-
 
 print(f"Finalizado")
