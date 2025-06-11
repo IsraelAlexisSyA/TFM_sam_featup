@@ -61,7 +61,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/000.png'
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/hole/001.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -830,8 +830,8 @@ for idx in anomalous_ids:
     print(f"Objeto {idx} es anómalo. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_000.png')
-
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_hole_001.png') #########################################################################################
+###################                                                            ###########################################################################################################
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
 print(f"Plot de anomalías guardado en: {output_anomalies_query_plot_om}")
@@ -840,6 +840,281 @@ print(f"Plot de anomalías guardado en: {output_anomalies_query_plot_om}")
 
 
 
+#------------------------------------- 3.6 Anomaly detection-------------------------------------------
+
+# --- 3.6 Anomaly Measurement Module (AMM) ---
+print("\n--- Iniciando Módulo de Medición de Anomalías (AMM) ---")
+
+def calculate_anomaly_map_matched(fobj_q_i, fobj_r_j, query_mask_original_shape, target_mask_h, target_mask_w):
+    """
+    Calculates the L2 distance anomaly map for a matched query object and its reference.
+    Features are (C, H_feat, W_feat)
+    """
+    C, H_feat, W_feat = fobj_q_i.shape
+
+    # Ensure features are on the same device and are 3D (C, H_feat, W_feat)
+    fobj_q_i_proc = fobj_q_i.to(device)
+    fobj_r_j_proc = fobj_r_j.to(device)
+
+    # Calculate L2 distance at each feature map pixel
+    # The norm is taken over the feature dimension (C)
+    diff = fobj_q_i_proc - fobj_r_j_proc
+    l2_distance_map = torch.norm(diff, p=2, dim=0) # Shape (H_feat, W_feat)
+
+    # Resize the anomaly map back to the original query image mask dimensions
+    # for consistent plotting and full image anomaly map creation
+    # Using F.interpolate for upsampling
+    l2_distance_map_resized = F.interpolate(
+        l2_distance_map.unsqueeze(0).unsqueeze(0), # Add batch and channel dims
+        size=(query_mask_original_shape[0], query_mask_original_shape[1]), # Original image H, W
+        mode='bilinear',
+        align_corners=False
+    ).squeeze(0).squeeze(0) # Remove batch and channel dims
+
+    return l2_distance_map_resized # Shape (Original_H, Original_W)
+
+
+def calculate_anomaly_map_unmatched_mahalanobis(fobj_q_i_pixel_feat, ref_pixel_features_flat):
+    """
+    Calculates Mahalanobis distance for a single pixel feature from an unmatched query object
+    against a collection of reference pixel features.
+    fobj_q_i_pixel_feat: (C,)
+    ref_pixel_features_flat: (Num_ref_pixels, C)
+    """
+    if ref_pixel_features_flat.shape[0] < ref_pixel_features_flat.shape[1]:
+        # Handle case where Num_ref_pixels < C, leading to singular covariance.
+        # This can happen if there aren't enough reference objects or if all objects are very similar.
+        # Add a small identity matrix to covariance for numerical stability, or fall back to L2.
+        # For simplicity, for now, we'll return a large score if covariance is singular.
+        # A more robust solution would be to use a pseudo-inverse or add a small regularization.
+        # For now, let's use a small constant for numerical stability of inverse
+        print(f"Warning: Not enough reference samples ({ref_pixel_features_flat.shape[0]}) for robust Mahalanobis calculation. Falling back to L2-like distance or handling singular matrix.")
+        # Fallback to squared Euclidean distance if not enough samples for covariance
+        if ref_pixel_features_flat.shape[0] == 0:
+            return torch.tensor(float('inf'), device=device) # No reference data
+        # Use mean for comparison if not enough samples for covariance
+        mean_ref_feat = torch.mean(ref_pixel_features_flat, dim=0)
+        return torch.norm(fobj_q_i_pixel_feat - mean_ref_feat, p=2) ** 2 # Squared L2 distance
+
+    mean_ref_feat = torch.mean(ref_pixel_features_flat, dim=0) # (C,)
+    
+    # Calculate covariance matrix
+    # torch.cov requires input as (num_features, num_samples) for columns as features.
+    # Our `ref_pixel_features_flat` is (Num_samples, C), so transpose it.
+    try:
+        cov_matrix = torch.cov(ref_pixel_features_flat.T) # (C, C)
+        # Add a small epsilon to the diagonal for numerical stability (regularization)
+        cov_matrix += torch.eye(cov_matrix.shape[0], device=device) * 1e-6
+        inv_cov_matrix = torch.inverse(cov_matrix) # (C, C)
+    except Exception as e:
+        print(f"Error calculating inverse covariance matrix: {e}. Falling back to L2-like distance.")
+        # Fallback if inverse fails (e.g., singular matrix even with regularization)
+        mean_ref_feat = torch.mean(ref_pixel_features_flat, dim=0)
+        return torch.norm(fobj_q_i_pixel_feat - mean_ref_feat, p=2) ** 2 # Squared L2 distance
+
+    diff = fobj_q_i_pixel_feat - mean_ref_feat # (C,)
+    # Mahalanobis distance squared: diff.T @ inv_cov @ diff
+    mahalanobis_sq = torch.matmul(diff.unsqueeze(0), torch.matmul(inv_cov_matrix, diff.unsqueeze(1))).squeeze()
+
+    return torch.sqrt(mahalanobis_sq) # Mahalanobis distance is sqrt of this
+
+def build_reference_pixel_distributions(all_fobj_r_list, target_mask_h, target_mask_w):
+    """
+    Builds pixel-wise mean and covariance for reference features across all reference images.
+    Returns dictionaries of (mean, covariance) for each (h_feat, w_feat) position.
+    """
+    pixel_features_per_location = {} # Stores list of features for each (h,w) in feature map resolution
+
+    # Initialize lists for each pixel location
+    C = all_fobj_r_list[0].shape[1] if len(all_fobj_r_list) > 0 else 0
+    if C == 0:
+        print("Warning: No reference objects to build distributions from.")
+        return {}
+    
+    for h_feat in range(target_mask_h):
+        for w_feat in range(target_mask_w):
+            pixel_features_per_location[(h_feat, w_feat)] = []
+
+    # Collect features for each pixel location from all reference objects in all reference images
+    for fobj_r_current_image in all_fobj_r_list: # (N_i, C, H_feat, W_feat)
+        for n_idx in range(fobj_r_current_image.shape[0]): # Iterate through each reference object
+            for h_feat in range(target_mask_h):
+                for w_feat in range(target_mask_w):
+                    pixel_feat = fobj_r_current_image[n_idx, :, h_feat, w_feat] # (C,)
+                    pixel_features_per_location[(h_feat, w_feat)].append(pixel_feat)
+
+    # Convert lists to tensors and calculate mean/covariance for each location
+    ref_pixel_distributions = {}
+    for (h_feat, w_feat), features_list in pixel_features_per_location.items():
+        if len(features_list) > 0:
+            features_tensor = torch.stack(features_list).to(device) # (Num_samples_at_pixel, C)
+            ref_pixel_distributions[(h_feat, w_feat)] = features_tensor # Store the raw features for Mahalanobis
+        else:
+            ref_pixel_distributions[(h_feat, w_feat)] = None # No data for this pixel location
+
+    return ref_pixel_distributions
+
+
+def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices,
+                            fobj_q, all_fobj_r_list,
+                            anomalous_ids, anomaly_detection_threshold,
+                            image_original_shape, target_mask_h, target_mask_w,
+                            ref_pixel_distributions, device):
+    """
+    Creates the full anomaly map for the query image.
+    """
+    # Initialize full anomaly map with zeros, same resolution as original image
+    full_anomaly_map = torch.zeros((image_original_shape[0], image_original_shape[1]), device=device, dtype=torch.float32)
+
+    # Keep track of which pixels have been processed to avoid overwriting or missing
+    processed_pixels_mask = torch.zeros((image_original_shape[0], image_original_shape[1]), dtype=torch.bool, device=device)
+
+    # Determine matched and unmatched objects based on the matching logic (already done)
+    # We need the actual best match for each query object
+    best_matches = {} # q_idx -> (best_ref_img_idx, best_ref_obj_idx, confidence)
+    
+    # Iterate through each query object
+    for q_idx in range(M):
+        # Determine if the query object is matched or unmatched based on your existing logic
+        is_matched = False
+        best_overall_confidence = -1.0
+        best_ref_match_idx = -1
+        best_ref_image_idx = -1
+        conf_to_trash_bin = -1.0
+
+        for i, (P_current, P_augmented_current) in enumerate(zip(P_matrices, P_augmented_full_matrices)):
+            if P_current.shape[0] == 0: continue # Skip empty P matrices
+
+            M_current, N_current = P_current.shape
+            if q_idx >= M_current: continue # Query object might not be in this P if M_current < M
+
+            max_conf_to_real_ref_current, best_ref_obj_idx_current = P_current[q_idx, :].max(dim=0)
+            conf_to_trash_bin_current = P_augmented_current[q_idx, N_current] # N_current is the trash bin column index
+
+            if max_conf_to_real_ref_current > best_overall_confidence:
+                best_overall_confidence = max_conf_to_real_ref_current
+                best_ref_match_idx = best_ref_obj_idx_current
+                best_ref_image_idx = i # Store which reference image this best match came from
+            
+            if conf_to_trash_bin_current > conf_to_trash_bin: # Keep track of the highest trash bin confidence
+                conf_to_trash_bin = conf_to_trash_bin_current
+
+
+        # Now, apply the anomaly condition for this specific query object
+        # This matches your existing anomaly detection logic
+        if best_overall_confidence > anomaly_detection_threshold and \
+           best_overall_confidence > conf_to_trash_bin:
+            is_matched = True
+        
+        # Get the query object's original mask (full resolution)
+        query_mask_dict = masks_data[q_idx]
+        query_mask_binary = torch.from_numpy(query_mask_dict['segmentation']).to(device) # (Original_H, Original_W)
+
+        # Get the query object's feature map (resized to TARGET_MASK_H, TARGET_MASK_W)
+        query_obj_feat_map = fobj_q[q_idx] # (C, TARGET_MASK_H, TARGET_MASK_W)
+
+        if is_matched and best_ref_image_idx != -1: # Matched object
+            # Retrieve the matched reference object's feature map
+            matched_ref_obj_feat_map = all_fobj_r_list[best_ref_image_idx][best_ref_match_idx] # (C, TARGET_MASK_H, TARGET_MASK_W)
+            
+            # Calculate L2 distance anomaly map for this matched object
+            # This function will also resize it back to original image dimensions
+            anomaly_score_map_obj = calculate_anomaly_map_matched(
+                query_obj_feat_map, matched_ref_obj_feat_map,
+                image_original_shape, target_mask_h, target_mask_w
+            )
+            
+            # Apply this score map only within the query object's mask
+            full_anomaly_map[query_mask_binary] = anomaly_score_map_obj[query_mask_binary]
+            processed_pixels_mask[query_mask_binary] = True
+
+        else: # Unmatched object (including those flagged as anomalous by previous logic)
+            # Calculate Mahalanobis distance for each pixel within the object's mask
+            
+            # Resize query object's feature map to original image resolution for pixel-wise mapping
+            # This is tricky because the Mahalanobis is calculated on FEATURES, not image pixels.
+            # We need to iterate over the FEATURE MAP pixels (H_feat, W_feat)
+            
+            anomaly_score_map_obj_unmatched = torch.zeros((target_mask_h, target_mask_w), device=device, dtype=torch.float32)
+
+            for h_feat in range(target_mask_h):
+                for w_feat in range(target_mask_w):
+                    q_pixel_feat = query_obj_feat_map[:, h_feat, w_feat] # (C,)
+                    
+                    if ref_pixel_distributions.get((h_feat, w_feat)) is not None:
+                        ref_pixel_feats_flat = ref_pixel_distributions[(h_feat, w_feat)]
+                        # Only calculate if there are enough samples for robust Mahalanobis, otherwise L2
+                        if ref_pixel_feats_flat.shape[0] > ref_pixel_feats_flat.shape[1]: # Num samples > C (feature dim)
+                             score = calculate_anomaly_map_unmatched_mahalanobis(q_pixel_feat, ref_pixel_feats_flat)
+                        else: # Not enough samples for Mahalanobis, fall back to L2 to mean
+                            mean_ref_feat = torch.mean(ref_pixel_feats_flat, dim=0)
+                            score = torch.norm(q_pixel_feat - mean_ref_feat, p=2)
+                    else: # No reference data for this pixel location, assign high anomaly score
+                        score = torch.tensor(float('inf'), device=device)
+                    
+                    anomaly_score_map_obj_unmatched[h_feat, w_feat] = score
+            
+            # Resize this anomaly map to original image dimensions
+            anomaly_score_map_obj_unmatched_resized = F.interpolate(
+                anomaly_score_map_obj_unmatched.unsqueeze(0).unsqueeze(0),
+                size=(image_original_shape[0], image_original_shape[1]),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0).squeeze(0)
+
+            # Apply this score map only within the query object's mask
+            full_anomaly_map[query_mask_binary] = anomaly_score_map_obj_unmatched_resized[query_mask_binary]
+            processed_pixels_mask[query_mask_binary] = True
+            
+    # Handle pixels not covered by any mask (if any remain, they should be considered normal or background)
+    # You might want a default score (e.g., 0) for these
+    # For now, if a pixel isn't covered by any object mask, it remains 0 (initialized).
+
+    # Normalize the anomaly map for better visualization (optional, but good practice)
+    # Ensure it's not all zeros if no anomalies found
+    if full_anomaly_map.max() > 0:
+        full_anomaly_map = full_anomaly_map / full_anomaly_map.max()
+    
+    return full_anomaly_map.cpu().numpy() # Return as numpy for plotting
+
+def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de Anomalías"):
+    """
+    Plots the anomaly map overlayed on the original image.
+    """
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image_np)
+    # Use a colormap that highlights high values (anomalies)
+    # cmap='hot' or 'jet' are good choices, with alpha for transparency
+    plt.imshow(anomaly_map_np, cmap='jet', alpha=0.6)
+    plt.colorbar(label='Puntuación de Anomalía')
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+        print(f"✅ Mapa de anomalías guardado en: {save_path}")
+    plt.show()
+    plt.close()
+
+# --- Main AMM execution ---
+# 1. Pre-calculate reference pixel distributions for unmatched object Mahalanobis distance
+# This is a one-time calculation over ALL reference object feature maps
+ref_pixel_distributions = build_reference_pixel_distributions(all_fobj_r_list, TARGET_MASK_H, TARGET_MASK_W)
+
+
+# 2. Create the full anomaly map
+full_query_anomaly_map = create_full_anomaly_map(
+    M, masks_data, P_matrices, P_augmented_full_matrices,
+    fobj_q, all_fobj_r_list,
+    anomalous_ids, anomaly_detection_threshold, # Use your existing threshold here
+    image_for_sam_np.shape, TARGET_MASK_H, TARGET_MASK_W,
+    ref_pixel_distributions, device
+)
+# 3. Plot the final anomaly map
+output_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_hole_001.png')
+plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_anomaly_map_filename)
+
+print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
 
 
 end_time = time.time()
