@@ -12,6 +12,12 @@ import time
 from featup.util import norm, unnorm
 from featup.plotting import plot_feats # Asegúrate de que esta importación sea correcta
 
+
+from sklearn.neighbors import NearestNeighbors
+import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
+
+
 # --- Configuración Inicial ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 input_size = 224 # Tamaño de entrada para DINOv2
@@ -26,10 +32,13 @@ W_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
 directorio_imagenes = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/train/good'
 
 # Rutas de archivo para cargar los mapas de características completos relevantes para el Coreset
-core_bank_features_file = os.path.join(directorio_imagenes, 'core_bank_features.pt')
+core_bank_features_file = os.path.join(directorio_imagenes, 'core_bank_features.pt') # no usado en este stage
 core_bank_filenames_file = os.path.join(directorio_imagenes, 'core_bank_filenames.pt')
 # --- NUEVO: Ruta para el banco de características del coreset relevante, ya aplanado y apilado ---
 coreset_relevant_flat_features_bank_file = os.path.join(directorio_imagenes, 'coreset_relevant_flat_features_bank.pt')
+
+# coreset_features_file from Stage 1 (THIS IS YOUR M)
+template_features_bank_coreset_file = os.path.join(directorio_imagenes, 'template_features_bank_coreset.pt')# para mapa de calor
 
 
 # --- Cargar los datos del coreset relevante ---
@@ -56,12 +65,12 @@ except Exception as e:
 
 
 # Define donde quieres guardar el plot
-plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_1'
+plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_2'# Nueva carpeta para esta etapa
 output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_plot.png')
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/001.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/print/001.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -98,6 +107,125 @@ def extract_dinov2_features_lr(image_path, model, image_transform, device):
 query_lr_features = extract_dinov2_features_lr(query_image_path, dinov2_model, transform, device)
 print(f"Dimensiones de características de consulta (baja resolución): {query_lr_features.shape}")
 
+#########################################
+##################################
+# Medir el tiempo de generación del mapa de calor
+start_time_heatmap = time.time()
+
+### AÑADIDO: Cálculo de distancias a nivel de parche y generación del mapa de calor ###
+
+# Aplanar las características de la imagen de consulta para obtener vectores de parches
+# query_lr_features_map tiene forma (1, C, H', W')
+query_patches_flat = query_lr_features.squeeze(0).permute(1, 2, 0).reshape(-1, query_lr_features.shape[1])
+# query_patches_flat ahora tiene forma (H'*W', C) => (256, 384) para DINOv2-S/14
+print(f"Dimensiones de parches de consulta aplanados: {query_patches_flat.shape}")
+
+### AÑADIDO: INICIO DEL BLOQUE DE CÁLCULO DE MAPA DE CALOR Y Q-SCORE ###
+start_time_coreset_load = time.time()
+
+# --- Cargar el banco de memoria del Coreset (el verdadero M) ---
+print("Cargando el banco de memoria (coreset_features)...")
+coreset_features = None # Este será el tensor (Num_Coreset_Patches, C)
+
+try:
+    # --- ESTA ES LA LÍNEA QUE CARGA coreset_features ---
+    coreset_features = torch.load(template_features_bank_coreset_file).to(device)
+    print(f"Coreset de características (M) cargado. Dimensión: {coreset_features.shape}")
+
+except FileNotFoundError as e:
+    print(f"Error al cargar el coreset de características: {e}. Asegúrate de que Stage 1 se haya ejecutado correctamente y el archivo '{template_features_bank_coreset_file}' exista.")
+    exit() # Salir si el archivo esencial no se encuentra
+except Exception as e:
+    print(f"Ocurrió un error al cargar o procesar el coreset de características: {e}")
+    exit()
+
+end_time_coreset_load = time.time()
+print(f"Tiempo para cargar el coreset: {end_time_coreset_load - start_time_coreset_load:.4f} segundos")
+
+
+
+# Mover el coreset a CPU para sklearn, si no quieres usar Faiss/torch.cdist (más complejo)
+coreset_features_cpu = coreset_features.cpu().numpy()
+query_patches_flat_cpu = query_patches_flat.cpu().numpy()
+
+# 1. Calcular distancias de coseno entre cada parche de consulta y el coreset
+print("\nCalculando distancias de coseno a nivel de parche...")
+start_time_distances = time.time()
+
+# Usar NearestNeighbors para encontrar el vecino más cercano y su distancia
+from sklearn.neighbors import NearestNeighbors
+# n_neighbors=1 porque solo queremos la distancia al más cercano
+# metric='cosine' para distancia de coseno
+# algorithm='brute' es simple, para grandes coreset, 'kd_tree' o 'ball_tree' o Faiss son mejores
+nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu)
+distances_to_nn, _ = nn_finder.kneighbors(query_patches_flat_cpu)
+# distances_to_nn tendrá forma (H'*W', 1)
+patch_anomaly_scores = distances_to_nn.flatten() # Forma (H'*W',)
+end_time_distances = time.time()
+print(f"Tiempo para calcular distancias de parches: {end_time_distances - start_time_distances:.4f} segundos")
+print(f"Forma de las puntuaciones de anomalía de parches: {patch_anomaly_scores.shape}")
+
+# 2. Generar el mapa de calor (heatmap)
+# Reorganizar las puntuaciones de los parches a la forma espacial (H', W')
+anomaly_map_lr = patch_anomaly_scores.reshape(H_prime, W_prime)
+print(f"Forma del mapa de anomalías de baja resolución: {anomaly_map_lr.shape}")
+
+# Upsampling Bilineal a la resolución de entrada original
+# Convertir a tensor PyTorch, añadir dimensiones de batch y canal, y mover a device
+anomaly_map_lr_tensor = torch.from_numpy(anomaly_map_lr).unsqueeze(0).unsqueeze(0).to(device) # Forma (1, 1, H', W')
+anomaly_map_upsampled = F.interpolate(anomaly_map_lr_tensor, size=(input_size, input_size), mode='bilinear', align_corners=False)
+anomaly_map_upsampled = anomaly_map_upsampled.squeeze().cpu().numpy() # Quitar dimensiones de batch/canal, a numpy
+
+# Suavizado Gaussiano (opcional, pero recomendado por el paper)
+# sigma = 4.0 es el valor del paper
+anomaly_map_smoothed = gaussian_filter(anomaly_map_upsampled, sigma=4.0)
+
+# Normalizar el mapa de anomalías para visualización (opcional, pero útil)
+# Escalar a [0, 1] o [0, 255]
+anomaly_map_final = (anomaly_map_smoothed - anomaly_map_smoothed.min()) / (anomaly_map_smoothed.max() - anomaly_map_smoothed.min() + 1e-8)
+
+print(f"Forma del mapa de calor final: {anomaly_map_final.shape}")
+
+# 3. Calcular el q-score (puntuación a nivel de imagen)
+# Tomar el 1% de las puntuaciones de anomalía de parche más altas
+num_top_patches = int(len(patch_anomaly_scores) * 0.01)
+if num_top_patches == 0 and len(patch_anomaly_scores) > 0: # Asegurarse de tomar al menos 1 si hay parches
+    num_top_patches = 1
+
+top_anomaly_scores = np.sort(patch_anomaly_scores)[-num_top_patches:]
+q_score = np.mean(top_anomaly_scores)
+print(f"Q-score (promedio del 1% superior de distancias): {q_score:.4f}")
+
+
+# 4. Visualización del mapa de calor
+plt.figure(figsize=(12, 6))
+
+plt.subplot(1, 2, 1)
+plt.imshow(query_img_pil)
+plt.title('Imagen de Consulta Original')
+plt.axis('off')
+
+plt.subplot(1, 2, 2)
+# Usar 'viridis' o 'jet' son buenas opciones para heatmaps
+plt.imshow(anomaly_map_final, cmap='jet')
+plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
+plt.colorbar(label='Puntuación de Anomalía Normalizada')
+plt.axis('off')
+
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_print_001.png')
+plt.tight_layout()
+plt.savefig(heatmap_output_filename)
+print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
+plt.close()
+
+print("\n--- ¡Generación del mapa de calor y q-score completada! ---")
+
+
+
+
+end_time_heatmap = time.time()
+print(f"Tiempo para generar el mapa de calor: {end_time_heatmap - start_time_heatmap:.4f} segundos")
+##################################
 
 # --- Función para buscar imágenes similares usando KNN (OPTIMIZADA) ---
 def buscar_imagenes_similares_knn(query_feature_map, pre_flattened_features_bank, k=3, nombres_archivos=None):
@@ -700,13 +828,13 @@ for fobj_r_current in all_fobj_r_list:
     pooled_r = apply_global_max_pool(fobj_r_current)
     all_fobj_r_pooled_list.append(pooled_r)
 
-fobj_q_norm = F.normalize(fobj_q_pooled, p=2, dim=1)
+fobj_q_norm = F.normalize(fobj_q_pooled, p=2, dim=1) # --> d_M_q tensor (M, C)
 
 all_fobj_r_norm_list = [F.normalize(fobj_r_pooled, p=2, dim=1)
-                        for fobj_r_pooled in all_fobj_r_pooled_list]
+                        for fobj_r_pooled in all_fobj_r_pooled_list] # --> d_N_r tensor (N, C)
 
 def max_similarities(query_feats, candidate_feats):
-    sim_matrix = torch.mm(query_feats, candidate_feats.T)
+    sim_matrix = torch.mm(query_feats, candidate_feats.T)# [-1, 1] producto punto...similar a similitud coseno si se normalizan A y B a vectores unitarios
     max_vals, _ = sim_matrix.max(dim=1)
     return max_vals
 
@@ -727,7 +855,7 @@ class ObjectMatchingModule(nn.Module):
                 else:
                     print(f"Advertencia: 'z' (bin_score) no encontrado en {superglue_weights_path}. Inicializando con valor predeterminado.")
                     z_value = 0.5
-                
+                                                #aqui puedes variar 0.5 por ej.
                 self.z = nn.Parameter(torch.tensor(z_value, dtype=torch.float32))
                 print(f"Parámetro 'z' cargado de SuperGlue: {self.z.item():.4f}")
 
@@ -785,9 +913,9 @@ object_matching_module = ObjectMatchingModule(
     sinkhorn_epsilon=0.1
 ).to(device)
 
+
 P_matrices = []
 P_augmented_full_matrices = []
-
 # Obtener etiquetas para los plots de la matriz
 query_obj_labels = [f"obj_{i}" for i in range(fobj_q_norm.shape[0])]
 
@@ -818,30 +946,35 @@ for i, d_N_r_current_image in enumerate(all_fobj_r_norm_list): # Cambié el nomb
 
 
 # --- Lógica de Detección de Anomalías ---
-M = fobj_q_norm.shape[0]
-
+# fobj_q_norm:(magnitud 1) normalizado a lo largo de una dim=1: en las columnas p=2: L2 distance 
+M = fobj_q_norm.shape[0]#devuelve el número de filas en el tensor que es el número de objetos de consulta total
+# la suma de sus cuadrados es 1.0; cada vector de características es escalado para que su norma L2 sea 1.0, vector unitario, valores individuales no restringidos a [0,1]
 is_matched_to_real_object = torch.zeros(M, dtype=torch.bool, device=device)
-best_match_confidence_overall = torch.full((M,), -1.0, device=device)
-best_match_to_trash_bin_confidence = torch.full((M,), -1.0, device=device)
+best_match_confidence_overall = torch.full((M,), -1.0, device=device) # inicializar con -1.0 para indicar que no hay coincidencia
+best_match_to_trash_bin_confidence = torch.full((M,), -1.0, device=device)# almacena la mejor confianza de coincidencia con el trash bin
 
-anomaly_detection_threshold = 0.15 # Umbral de detección de anomalías
+anomaly_detection_threshold = 0.10 # Umbral de detección de anomalías
+
+
 
 for P_current, P_augmented_current in zip(P_matrices, P_augmented_full_matrices):
     if P_current.shape[0] == 0: continue
 
     M_current, N_current = P_current.shape
 
-    max_conf_to_real_ref, _ = P_current.max(dim=1)
+    max_conf_to_real_ref, _ = P_current.max(dim=1)  #sacar el max en columnas, devuelve el máximo de cada fila (query) y su índice
+    # tensor de máximos por fila (query vs. trash bin)
+    #tensor: contiene max confianza de asign a cada objeto de consulta a los objetos de referencia reales
 
-    conf_to_trash_bin_current = P_augmented_current[:M_current, N_current]
+    conf_to_trash_bin_current = P_augmented_current[:M_current, N_current]#Para cada objeto de consulta, se extrae la confianza de asignación al "trash bin" desde la última columna
 
     for q_idx in range(M_current):
-        if max_conf_to_real_ref[q_idx] > best_match_confidence_overall[q_idx]:
+        if max_conf_to_real_ref[q_idx] > best_match_confidence_overall[q_idx]: #actualizar al maximo global best match iterando
             best_match_confidence_overall[q_idx] = max_conf_to_real_ref[q_idx]
 
-        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]:
+        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]: #actualizar al maximo global bin 
              best_match_to_trash_bin_confidence[q_idx] = conf_to_trash_bin_current[q_idx]
-
+                                       # anomaly_detection_threshold
         if max_conf_to_real_ref[q_idx] > anomaly_detection_threshold and \
            max_conf_to_real_ref[q_idx] > conf_to_trash_bin_current[q_idx]:
             is_matched_to_real_object[q_idx] = True
@@ -850,12 +983,17 @@ anomalies_final = ~is_matched_to_real_object
 
 anomalous_ids = anomalies_final.nonzero(as_tuple=True)[0].tolist()
 anomalous_info = []
-for idx in anomalous_ids:
-    anomalous_info.append((idx, best_match_confidence_overall[idx].item())) # Incluir la mejor similitud real
-    print(f"Objeto {idx} es anómalo. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_001.png') #########################################################################################
+for idx in range(M):
+    if idx in anomalous_ids:
+        anomalous_info.append((idx, best_match_confidence_overall[idx].item())) # Incluir la mejor similitud real
+        print(f"Objeto {idx} es anómalo. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
+    else:
+        print(f"Objeto {idx} asignado a un objeto real. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
+
+
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_print_001.png') #########################################################################################
 ###################                                                            ###########################################################################################################
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
@@ -998,11 +1136,13 @@ def build_reference_pixel_distributions(all_fobj_r_list, target_mask_h, target_m
     return ref_pixel_distributions
 
 # --- MODIFICADA: create_full_anomaly_map ---
+# --- MODIFICADA: create_full_anomaly_map ---
 def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices,
                             fobj_q, all_fobj_r_list,
                             anomalous_ids, anomaly_detection_threshold,
                             image_original_shape, target_mask_h, target_mask_w,
-                            ref_pixel_distributions, device):
+                            ref_pixel_distributions, device,
+                            global_anomaly_score_ceiling=None): # ¡NUEVO PARÁMETRO AQUÍ!
     """
     Creates the full anomaly map for the query image, and separate matched/unmatched maps.
     """
@@ -1078,7 +1218,7 @@ def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices
                         
                         # Only calculate Mahalanobis if enough samples, otherwise L2
                         if ref_pixel_feats_flat.shape[0] > ref_pixel_feats_flat.shape[1]: # Num samples > C (feature dim)
-                             score = calculate_anomaly_map_unmatched_mahalanobis(q_pixel_feat, ref_pixel_feats_flat)
+                            score = calculate_anomaly_map_unmatched_mahalanobis(q_pixel_feat, ref_pixel_feats_flat)
                         else: # Not enough samples for robust Mahalanobis, fall back to L2 to mean
                             mean_ref_feat = torch.mean(ref_pixel_feats_flat, dim=0)
                             score = torch.norm(q_pixel_feat - mean_ref_feat, p=2)
@@ -1098,35 +1238,58 @@ def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices
             # Apply this score map only within the query object's mask
             unmatched_anomaly_map[query_mask_binary] = anomaly_score_map_obj_unmatched_resized[query_mask_binary]
             processed_pixels_mask[query_mask_binary] = True # Mark pixels as processed
-            
+
     # Handle pixels not covered by any mask (if any remain, they should be considered normal or background)
     # For now, if a pixel isn't covered by any object mask, it remains 0 (initialized).
 
-    # --- Normalización y Clamping para CADA MAPA ---
-    # Clamping
-    max_score_matched = matched_anomaly_map[matched_anomaly_map != float('inf')].max() if matched_anomaly_map[matched_anomaly_map != float('inf')].numel() > 0 else 0.0
-    max_score_unmatched = unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].max() if unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].numel() > 0 else 0.0
+    # --- INICIO: SECCIÓN DE IMPRESIÓN DE SCORES CRUDOS ---
+    # Calcular los máximos actuales para los mapas ANTES de cualquier clamping o normalización
+    max_score_matched_raw = matched_anomaly_map[matched_anomaly_map != float('inf')].max().item() if matched_anomaly_map[matched_anomaly_map != float('inf')].numel() > 0 else 0.0
+    max_score_unmatched_raw = unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].max().item() if unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].numel() > 0 else 0.0
     
-    max_clamp_value = max(max_score_matched, max_score_unmatched) * 1.5
-    if max_clamp_value < 1e-6: # Evitar división por cero si todos los scores son bajos
-        max_clamp_value = 1.0
+    print(f"\n--- VALORES DE ANOMALÍA MÁXIMOS CRUDOS (ANTES DE CLAMPING/NORMALIZACIÓN) ---")
+    print(f"Max score matched (raw): {max_score_matched_raw:.4f}")
+    print(f"Max score unmatched (raw): {max_score_unmatched_raw:.4f}")
+    print(f"------------------------------------------------------------------\n")
+    # --- FIN: SECCIÓN DE IMPRESIÓN DE SCORES CRUDOS ---
 
-    matched_anomaly_map = torch.clamp(matched_anomaly_map, min=0.0, max=max_clamp_value)
-    unmatched_anomaly_map = torch.clamp(unmatched_anomaly_map, min=0.0, max=max_clamp_value)
-
-    # Normalización [0, 1]
-    if matched_anomaly_map.max() > 0:
-        matched_anomaly_map = matched_anomaly_map / matched_anomaly_map.max()
-    if unmatched_anomaly_map.max() > 0:
-        unmatched_anomaly_map = unmatched_anomaly_map / unmatched_anomaly_map.max()
+    # --- NORMALIZACIÓN Y CLAMPING PARA CADA MAPA (Lógica modificada para usar global_anomaly_score_ceiling) ---
     
-    # Crear el mapa completo como la suma (o cualquier combinación que desees)
-    full_anomaly_map = matched_anomaly_map + unmatched_anomaly_map
-    if full_anomaly_map.max() > 0:
-        full_anomaly_map = full_anomaly_map / full_anomaly_map.max()
+    # 1. Determinar el valor de referencia para el clamping y la normalización.
+    if global_anomaly_score_ceiling is not None:
+        effective_clamp_and_norm_value = global_anomaly_score_ceiling
+    else:
+        # Lógica adaptativa anterior (si no se especifica un valor global)
+        max_score_matched_for_adaptive = matched_anomaly_map[matched_anomaly_map != float('inf')].max() if matched_anomaly_map[matched_anomaly_map != float('inf')].numel() > 0 else 0.0
+        max_score_unmatched_for_adaptive = unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].max() if unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].numel() > 0 else 0.0
+        
+        effective_clamp_and_norm_value = max(max_score_matched_for_adaptive, max_score_unmatched_for_adaptive) * 1.5
+    
+    # Asegurarse de que el valor no sea demasiado pequeño para evitar división por cero
+    if effective_clamp_and_norm_value < 1e-6:
+        effective_clamp_and_norm_value = 1.0
+
+    # 2. Aplicar el clamping (recortar los valores que exceden el límite superior)
+    matched_anomaly_map_clamped = torch.clamp(matched_anomaly_map, min=0.0, max=effective_clamp_and_norm_value)
+    unmatched_anomaly_map_clamped = torch.clamp(unmatched_anomaly_map, min=0.0, max=effective_clamp_and_norm_value)
+
+    # 3. Normalizar los mapas resultantes a [0, 1]
+    if effective_clamp_and_norm_value > 0:
+        matched_anomaly_map_normalized = matched_anomaly_map_clamped / effective_clamp_and_norm_value
+        unmatched_anomaly_map_normalized = unmatched_anomaly_map_clamped / effective_clamp_and_norm_value
+    else:
+        matched_anomaly_map_normalized = matched_anomaly_map_clamped
+        unmatched_anomaly_map_normalized = unmatched_anomaly_map_clamped
+
+    # Crear el mapa completo como la suma de los mapas normalizados
+    full_anomaly_map = matched_anomaly_map_normalized + unmatched_anomaly_map_normalized
+    # Recortar a 1.0 si la suma excede 1.0
+    full_anomaly_map = torch.clamp(full_anomaly_map, min=0.0, max=1.0)
     
     # Retornar los tres mapas
-    return matched_anomaly_map.cpu().numpy(), unmatched_anomaly_map.cpu().numpy(), full_anomaly_map.cpu().numpy()
+    return matched_anomaly_map_normalized.cpu().numpy(), unmatched_anomaly_map_normalized.cpu().numpy(), full_anomaly_map.cpu().numpy()
+
+
 
 # --- La función plot_anomaly_map (sin cambios en la función en sí) ---
 def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de Anomalías"):
@@ -1148,13 +1311,21 @@ def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de An
     plt.close()
 
 
-
-
 # --- Main AMM execution ---
 # 1. Pre-calculate reference pixel distributions for unmatched object Mahalanobis distance
 # Ya no es necesario pasar 'device' a build_reference_pixel_distributions si ya está definido globalmente
 ref_pixel_distributions = build_reference_pixel_distributions(all_fobj_r_list, TARGET_MASK_H, TARGET_MASK_W)
 
+# 1.2. Create the full anomaly map, and now also separate matched/unmatched maps
+GLOBAL_ANOMALY_SCORE_CEILING = 35.0 # <--- ¡AJUSTA ESTE VALOR! Prueba con 20.0, 10.0, etc.
+matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full_anomaly_map(
+    M, masks_data, P_matrices, P_augmented_full_matrices,
+    fobj_q, all_fobj_r_list,
+    anomalous_ids, anomaly_detection_threshold,
+    image_for_sam_np.shape, TARGET_MASK_H, TARGET_MASK_W,
+    ref_pixel_distributions, device,
+    global_anomaly_score_ceiling=GLOBAL_ANOMALY_SCORE_CEILING # ¡PASAMOS EL NUEVO PARÁMETRO!
+)
 
 # 2. Create the full anomaly map, and now also separate matched/unmatched maps
 matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full_anomaly_map(
@@ -1166,21 +1337,18 @@ matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full
 )
 
 # 3. Plot the final anomaly map (General)
-output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_crack_001.png')
+output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_print_001.png')
 plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_full_anomaly_map_filename, title="Mapa de Anomalías General")
 
 # 4. Plot the Matched Anomaly Map
-output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_crack_001.png')
+output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_print_001.png')
 plot_anomaly_map(matched_anomaly_map, image_for_sam_np, save_path=output_matched_anomaly_map_filename, title="Mapa de Anomalías (Objetos Emparejados)")
 
 # 5. Plot the Unmatched Anomaly Map
-output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_crack_001.png')
+output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_print_001.png')
 plot_anomaly_map(unmatched_anomaly_map, image_for_sam_np, save_path=output_unmatched_anomaly_map_filename, title="Mapa de Anomalías (Objetos No Emparejados)")
 
 print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
-
-
-
 
 
 
