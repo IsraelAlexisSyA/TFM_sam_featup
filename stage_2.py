@@ -61,7 +61,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/hole/001.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/001.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -339,30 +339,35 @@ except FileNotFoundError:
     print(f"Error: No se encontró la imagen en la ruta: {query_image_path}")
     exit()
 
-# --- Parámetros para el grid de puntos ---
-# Puedes ajustar estos valores según la densidad de puntos que desees
-# Se usará 'points_per_side' para definir una cuadrícula cuadrada.
-# Por ejemplo, si pones 16, se generará una cuadrícula de 16x16 puntos.
+# --- Parámetros para el grid de puntos y filtrado de máscaras ---
 points_grid_density = 16 # 16 - 12 etc Número de puntos a lo largo de un lado del grid
+min_mask_area_pixels = 100.0 #  100 equivale a 1000 en mask_info Área mínima de la máscara para filtrar (en píxeles)
+max_mask_area_pixels = 450000.0 # Área máxima de la máscara para filtrar (en píxeles)
 
 # Inicializar el generador de máscaras automático
-mask_generator = SAM2AutomaticMaskGenerator(
+mask_generator_query = SAM2AutomaticMaskGenerator(
     model=sam2_model,
     points_per_side=points_grid_density, # Usamos la variable que definimos
     points_per_batch=256, # 64 - 256 Número de puntos procesados en cada lote (ajustable según tu GPU)
-    pred_iou_thresh=0.4, # 0.4  0.88 Umbral de confianza para filtrar máscaras
+    pred_iou_thresh=0.48, # 0.4  0.88 Umbral de confianza para filtrar máscaras
     stability_score_thresh=0.7, # 0.8 Umbral de estabilidad para filtrar máscaras
     crop_n_layers=0, # Desactiva el cropping batch de recorte 
     #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
-    min_mask_region_area=100.0, # Área mínima de la máscara para filtrar (en píxeles)
+    min_mask_region_area=min_mask_area_pixels, # Área mínima de la máscara para filtrar (en píxeles)
 )
 
-# CORRECCIÓN AQUÍ: Usamos la variable 'points_grid_density' que contiene el valor
+# Usamos la variable 'points_grid_density' que contiene el valor
 print(f"Generando máscaras con un grid de {points_grid_density}x{points_grid_density} puntos...")
 
 # Generar máscaras
-masks_data = mask_generator.generate(image_for_sam_np)
+masks_data = mask_generator_query.generate(image_for_sam_np)
 print(f"Tipo de dato de masks_data: {type(masks_data)}")
+
+# Filtra las máscaras directamente y reasigna el resultado a masks_data
+masks_data = [mask_info for mask_info in masks_data if mask_info['area'] <= max_mask_area_pixels]
+print(f"Se generaron {len(masks_data)} máscaras después de filtrar por área máxima.")
+# El resto de tu código que utiliza 'masks_data' ahora operará sobre las máscaras filtradas.
+
 
 
 print(f"Se generaron {len(masks_data)} máscaras de consulta.")
@@ -401,6 +406,19 @@ plt.savefig(output_query_grid_mask_filename)
 print(f"Plot de máscaras del grid para la imagen de consulta guardado en: {output_query_grid_mask_filename}")
 plt.close() # Close the figure to free memory
 
+# --------------Aplicando SAM MASK a las imágenes similares ---
+# Inicializar el generador de máscaras automático similares
+mask_generator = SAM2AutomaticMaskGenerator(
+    model=sam2_model,
+    points_per_side=points_grid_density, # Usamos la variable que definimos
+    points_per_batch=256, # 64 - 256 Número de puntos procesados en cada lote (ajustable según tu GPU)
+    pred_iou_thresh=0.48, # 0.4  0.88 Umbral de confianza para filtrar máscaras
+    stability_score_thresh=0.7, # 0.8 Umbral de estabilidad para filtrar máscaras
+    crop_n_layers=0, # Desactiva el cropping batch de recorte 
+    #crop_n_points_downscale_factor (por defecto 1) depende de crop_n_layers > 1
+    min_mask_region_area=800, # Área mínima de la máscara para filtrar (en píxeles)
+)
+
 
 # --- Aplicando SAM MASK a las imágenes similares ---
 print("\nGenerando y visualizando máscaras SAM para las imágenes similares...")
@@ -413,6 +431,13 @@ for i, similar_image_path in enumerate(rutas_imagenes_similares):
         print(f"--- Procesando: {os.path.basename(similar_image_path)} ---") # Add a clear separator
         current_similar_masks_data = mask_generator.generate(image_np_similar_for_sam)
         print(f"Se generaron {len(current_similar_masks_data)} máscaras para la imagen similar {i + 1}.")
+        
+        # Filtrar por área máxima
+        current_similar_masks_data = [
+            mask_info for mask_info in current_similar_masks_data 
+            if mask_info['area'] <= max_mask_area_pixels
+        ]
+        
         similar_masks_raw_list.append(current_similar_masks_data) # Guardar las máscaras generadas para esta imagen
         print(f"Dimensiones imagen similar para SAM (np.array): {image_np_similar_for_sam.shape}")
         #print(f"Se generaron {len(current_similar_masks_data)} máscaras para {os.path.basename(similar_image_path)}.")
@@ -799,7 +824,7 @@ is_matched_to_real_object = torch.zeros(M, dtype=torch.bool, device=device)
 best_match_confidence_overall = torch.full((M,), -1.0, device=device)
 best_match_to_trash_bin_confidence = torch.full((M,), -1.0, device=device)
 
-anomaly_detection_threshold = 0.19 # Umbral de detección de anomalías
+anomaly_detection_threshold = 0.15 # Umbral de detección de anomalías
 
 for P_current, P_augmented_current in zip(P_matrices, P_augmented_full_matrices):
     if P_current.shape[0] == 0: continue
@@ -830,7 +855,7 @@ for idx in anomalous_ids:
     print(f"Objeto {idx} es anómalo. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_hole_001.png') #########################################################################################
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_001.png') #########################################################################################
 ###################                                                            ###########################################################################################################
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
@@ -843,8 +868,24 @@ print(f"Plot de anomalías guardado en: {output_anomalies_query_plot_om}")
 #------------------------------------- 3.6 Anomaly detection-------------------------------------------
 
 # --- 3.6 Anomaly Measurement Module (AMM) ---
-print("\n--- Iniciando Módulo de Medición de Anomalías (AMM) ---")
+#------------------------------------ 3.6 Anomaly detection-------------------------------------------Add commentMore actions
 
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import time
+
+# Asumiendo que 'device' y otras variables globales están definidas en tu script principal
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# TARGET_MASK_H y TARGET_MASK_W (actualmente 128x128 para el cálculo de scores)
+# H_prime, W_prime (la resolución nativa de DinoV2, 16x16)
+# Definiciones de calculate_anomaly_map_matched y calculate_anomaly_map_unmatched_mahalanobis
+# y build_reference_pixel_distributions (las que acabas de proporcionar) van aquí.
+
+# --- Tu función calculate_anomaly_map_matched (sin cambios en la función en sí) ---
 def calculate_anomaly_map_matched(fobj_q_i, fobj_r_j, query_mask_original_shape, target_mask_h, target_mask_w):
     """
     Calculates the L2 distance anomaly map for a matched query object and its reference.
@@ -874,6 +915,7 @@ def calculate_anomaly_map_matched(fobj_q_i, fobj_r_j, query_mask_original_shape,
     return l2_distance_map_resized # Shape (Original_H, Original_W)
 
 
+# --- Tu función calculate_anomaly_map_unmatched_mahalanobis (sin cambios en la función en sí) ---
 def calculate_anomaly_map_unmatched_mahalanobis(fobj_q_i_pixel_feat, ref_pixel_features_flat):
     """
     Calculates Mahalanobis distance for a single pixel feature from an unmatched query object
@@ -918,6 +960,7 @@ def calculate_anomaly_map_unmatched_mahalanobis(fobj_q_i_pixel_feat, ref_pixel_f
 
     return torch.sqrt(mahalanobis_sq) # Mahalanobis distance is sqrt of this
 
+# --- Tu función build_reference_pixel_distributions (sin cambios en la función en sí) ---
 def build_reference_pixel_distributions(all_fobj_r_list, target_mask_h, target_mask_w):
     """
     Builds pixel-wise mean and covariance for reference features across all reference images.
@@ -954,26 +997,23 @@ def build_reference_pixel_distributions(all_fobj_r_list, target_mask_h, target_m
 
     return ref_pixel_distributions
 
-
+# --- MODIFICADA: create_full_anomaly_map ---
 def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices,
                             fobj_q, all_fobj_r_list,
                             anomalous_ids, anomaly_detection_threshold,
                             image_original_shape, target_mask_h, target_mask_w,
                             ref_pixel_distributions, device):
     """
-    Creates the full anomaly map for the query image.
+    Creates the full anomaly map for the query image, and separate matched/unmatched maps.
     """
-    # Initialize full anomaly map with zeros, same resolution as original image
-    full_anomaly_map = torch.zeros((image_original_shape[0], image_original_shape[1]), device=device, dtype=torch.float32)
-
-    # Keep track of which pixels have been processed to avoid overwriting or missing
+    # Initialize separate anomaly maps with zeros, same resolution as original image
+    matched_anomaly_map = torch.zeros((image_original_shape[0], image_original_shape[1]), device=device, dtype=torch.float32)
+    unmatched_anomaly_map = torch.zeros((image_original_shape[0], image_original_shape[1]), device=device, dtype=torch.float32)
+    
+    # Initialize a mask to keep track of processed pixels (optional, but good for debugging/completeness)
     processed_pixels_mask = torch.zeros((image_original_shape[0], image_original_shape[1]), dtype=torch.bool, device=device)
 
-    # Determine matched and unmatched objects based on the matching logic (already done)
-    # We need the actual best match for each query object
-    best_matches = {} # q_idx -> (best_ref_img_idx, best_ref_obj_idx, confidence)
-    
-    # Iterate through each query object
+    # Iterar a través de cada objeto de consulta
     for q_idx in range(M):
         # Determine if the query object is matched or unmatched based on your existing logic
         is_matched = False
@@ -999,13 +1039,11 @@ def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices
             if conf_to_trash_bin_current > conf_to_trash_bin: # Keep track of the highest trash bin confidence
                 conf_to_trash_bin = conf_to_trash_bin_current
 
-
         # Now, apply the anomaly condition for this specific query object
-        # This matches your existing anomaly detection logic
         if best_overall_confidence > anomaly_detection_threshold and \
            best_overall_confidence > conf_to_trash_bin:
             is_matched = True
-        
+            
         # Get the query object's original mask (full resolution)
         query_mask_dict = masks_data[q_idx]
         query_mask_binary = torch.from_numpy(query_mask_dict['segmentation']).to(device) # (Original_H, Original_W)
@@ -1019,23 +1057,17 @@ def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices
             
             # Calculate L2 distance anomaly map for this matched object
             # This function will also resize it back to original image dimensions
-            anomaly_score_map_obj = calculate_anomaly_map_matched(
+            anomaly_score_map_obj_resized = calculate_anomaly_map_matched(
                 query_obj_feat_map, matched_ref_obj_feat_map,
-                image_original_shape, target_mask_h, target_mask_w
+                image_original_shape, target_mask_h, target_mask_w # These target_mask_h/w are 128x128
             )
             
             # Apply this score map only within the query object's mask
-            full_anomaly_map[query_mask_binary] = anomaly_score_map_obj[query_mask_binary]
-            processed_pixels_mask[query_mask_binary] = True
+            matched_anomaly_map[query_mask_binary] = anomaly_score_map_obj_resized[query_mask_binary]
+            processed_pixels_mask[query_mask_binary] = True # Mark pixels as processed
 
         else: # Unmatched object (including those flagged as anomalous by previous logic)
-            # Calculate Mahalanobis distance for each pixel within the object's mask
-            
-            # Resize query object's feature map to original image resolution for pixel-wise mapping
-            # This is tricky because the Mahalanobis is calculated on FEATURES, not image pixels.
-            # We need to iterate over the FEATURE MAP pixels (H_feat, W_feat)
-            
-            anomaly_score_map_obj_unmatched = torch.zeros((target_mask_h, target_mask_w), device=device, dtype=torch.float32)
+            anomaly_score_map_obj_unmatched_low_res = torch.zeros((target_mask_h, target_mask_w), device=device, dtype=torch.float32)
 
             for h_feat in range(target_mask_h):
                 for w_feat in range(target_mask_w):
@@ -1043,40 +1075,60 @@ def create_full_anomaly_map(M, masks_data, P_matrices, P_augmented_full_matrices
                     
                     if ref_pixel_distributions.get((h_feat, w_feat)) is not None:
                         ref_pixel_feats_flat = ref_pixel_distributions[(h_feat, w_feat)]
-                        # Only calculate if there are enough samples for robust Mahalanobis, otherwise L2
+                        
+                        # Only calculate Mahalanobis if enough samples, otherwise L2
                         if ref_pixel_feats_flat.shape[0] > ref_pixel_feats_flat.shape[1]: # Num samples > C (feature dim)
                              score = calculate_anomaly_map_unmatched_mahalanobis(q_pixel_feat, ref_pixel_feats_flat)
-                        else: # Not enough samples for Mahalanobis, fall back to L2 to mean
+                        else: # Not enough samples for robust Mahalanobis, fall back to L2 to mean
                             mean_ref_feat = torch.mean(ref_pixel_feats_flat, dim=0)
                             score = torch.norm(q_pixel_feat - mean_ref_feat, p=2)
                     else: # No reference data for this pixel location, assign high anomaly score
                         score = torch.tensor(float('inf'), device=device)
                     
-                    anomaly_score_map_obj_unmatched[h_feat, w_feat] = score
+                    anomaly_score_map_obj_unmatched_low_res[h_feat, w_feat] = score
             
             # Resize this anomaly map to original image dimensions
             anomaly_score_map_obj_unmatched_resized = F.interpolate(
-                anomaly_score_map_obj_unmatched.unsqueeze(0).unsqueeze(0),
+                anomaly_score_map_obj_unmatched_low_res.unsqueeze(0).unsqueeze(0),
                 size=(image_original_shape[0], image_original_shape[1]),
                 mode='bilinear',
                 align_corners=False
             ).squeeze(0).squeeze(0)
 
             # Apply this score map only within the query object's mask
-            full_anomaly_map[query_mask_binary] = anomaly_score_map_obj_unmatched_resized[query_mask_binary]
-            processed_pixels_mask[query_mask_binary] = True
+            unmatched_anomaly_map[query_mask_binary] = anomaly_score_map_obj_unmatched_resized[query_mask_binary]
+            processed_pixels_mask[query_mask_binary] = True # Mark pixels as processed
             
     # Handle pixels not covered by any mask (if any remain, they should be considered normal or background)
-    # You might want a default score (e.g., 0) for these
     # For now, if a pixel isn't covered by any object mask, it remains 0 (initialized).
 
-    # Normalize the anomaly map for better visualization (optional, but good practice)
-    # Ensure it's not all zeros if no anomalies found
+    # --- Normalización y Clamping para CADA MAPA ---
+    # Clamping
+    max_score_matched = matched_anomaly_map[matched_anomaly_map != float('inf')].max() if matched_anomaly_map[matched_anomaly_map != float('inf')].numel() > 0 else 0.0
+    max_score_unmatched = unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].max() if unmatched_anomaly_map[unmatched_anomaly_map != float('inf')].numel() > 0 else 0.0
+    
+    max_clamp_value = max(max_score_matched, max_score_unmatched) * 1.5
+    if max_clamp_value < 1e-6: # Evitar división por cero si todos los scores son bajos
+        max_clamp_value = 1.0
+
+    matched_anomaly_map = torch.clamp(matched_anomaly_map, min=0.0, max=max_clamp_value)
+    unmatched_anomaly_map = torch.clamp(unmatched_anomaly_map, min=0.0, max=max_clamp_value)
+
+    # Normalización [0, 1]
+    if matched_anomaly_map.max() > 0:
+        matched_anomaly_map = matched_anomaly_map / matched_anomaly_map.max()
+    if unmatched_anomaly_map.max() > 0:
+        unmatched_anomaly_map = unmatched_anomaly_map / unmatched_anomaly_map.max()
+    
+    # Crear el mapa completo como la suma (o cualquier combinación que desees)
+    full_anomaly_map = matched_anomaly_map + unmatched_anomaly_map
     if full_anomaly_map.max() > 0:
         full_anomaly_map = full_anomaly_map / full_anomaly_map.max()
     
-    return full_anomaly_map.cpu().numpy() # Return as numpy for plotting
+    # Retornar los tres mapas
+    return matched_anomaly_map.cpu().numpy(), unmatched_anomaly_map.cpu().numpy(), full_anomaly_map.cpu().numpy()
 
+# --- La función plot_anomaly_map (sin cambios en la función en sí) ---
 def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de Anomalías"):
     """
     Plots the anomaly map overlayed on the original image.
@@ -1084,7 +1136,6 @@ def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de An
     plt.figure(figsize=(10, 10))
     plt.imshow(image_np)
     # Use a colormap that highlights high values (anomalies)
-    # cmap='hot' or 'jet' are good choices, with alpha for transparency
     plt.imshow(anomaly_map_np, cmap='jet', alpha=0.6)
     plt.colorbar(label='Puntuación de Anomalía')
     plt.title(title)
@@ -1096,25 +1147,41 @@ def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de An
     plt.show()
     plt.close()
 
+
+
+
 # --- Main AMM execution ---
 # 1. Pre-calculate reference pixel distributions for unmatched object Mahalanobis distance
-# This is a one-time calculation over ALL reference object feature maps
+# Ya no es necesario pasar 'device' a build_reference_pixel_distributions si ya está definido globalmente
 ref_pixel_distributions = build_reference_pixel_distributions(all_fobj_r_list, TARGET_MASK_H, TARGET_MASK_W)
 
 
-# 2. Create the full anomaly map
-full_query_anomaly_map = create_full_anomaly_map(
+# 2. Create the full anomaly map, and now also separate matched/unmatched maps
+matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full_anomaly_map(
     M, masks_data, P_matrices, P_augmented_full_matrices,
     fobj_q, all_fobj_r_list,
     anomalous_ids, anomaly_detection_threshold, # Use your existing threshold here
     image_for_sam_np.shape, TARGET_MASK_H, TARGET_MASK_W,
     ref_pixel_distributions, device
 )
-# 3. Plot the final anomaly map
-output_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_hole_001.png')
-plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_anomaly_map_filename)
+
+# 3. Plot the final anomaly map (General)
+output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_crack_001.png')
+plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_full_anomaly_map_filename, title="Mapa de Anomalías General")
+
+# 4. Plot the Matched Anomaly Map
+output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_crack_001.png')
+plot_anomaly_map(matched_anomaly_map, image_for_sam_np, save_path=output_matched_anomaly_map_filename, title="Mapa de Anomalías (Objetos Emparejados)")
+
+# 5. Plot the Unmatched Anomaly Map
+output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_crack_001.png')
+plot_anomaly_map(unmatched_anomaly_map, image_for_sam_np, save_path=output_unmatched_anomaly_map_filename, title="Mapa de Anomalías (Objetos No Emparejados)")
 
 print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
+
+
+
+
 
 
 end_time = time.time()
