@@ -225,138 +225,91 @@ end_time_heatmap = time.time()
 print(f"Tiempo para generar el mapa de calor: {end_time_heatmap - start_time_heatmap:.4f} segundos")
 
 ###########################################################################
-start_time_point_heatmap = time.time()
-### AÑADIDO: INICIO DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN REVISADA ###
-
 
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 from PIL import Image
-import matplotlib.patches as patches
 from skimage import measure # Para componentes conectados y propiedades de región
+import time # Asegúrate de importar time
 
-# --- Variables de configuración y resultados previos que ya deben estar definidos: ---
-# anomaly_map_final (el heatmap normalizado de 0 a 1)
-# query_img_pil (la imagen original PIL)
-# plot_save_directory_on_server
-# input_size (el tamaño al que se escaló la imagen para DINOv2 y el heatmap)
-# q_score (la puntuación general de la imagen)
+# --- Variables de configuración y resultados previos (ejemplo, asegúrate de que existen en tu script principal) ---
+# ... (asegúrate que todas las variables necesarias como anomaly_map_final, query_img_pil, etc. están definidas) ...
+
+# --------------------------------------------------------------------------------------
+# Tiempo total del proceso de puntos/regiones (incluyendo TODOS los plots)
+start_time_all_plotting = time.time()
+# --------------------------------------------------------------------------------------
 
 
-### AÑADIDO: INICIO DEL BLOQUE DE DETECCIÓN DE REGIONES FUERTES DE ANOMALÍA ###
+# --- 1. Visualización de los puntos del 1% más anómalo ---
 
-# --- 5. Detección y visualización de regiones de anomalía "fuertes" ---
+start_time_recabado = time.time()
+num_top_patches_to_consider = int(len(patch_anomaly_scores) * 0.01)
+if num_top_patches_to_consider == 0 and len(patch_anomaly_scores) > 0:
+    num_top_patches_to_consider = 1
 
-print("\nBuscando y visualizando regiones con anomalías fuertes en el mapa de calor...")
+original_img_width, original_img_height = query_img_pil.size
+scale_x = original_img_width / input_size
+scale_y = original_img_height / input_size
 
-# Define un umbral para las "regiones fuertes de anomalía".
-# Este valor es crítico. Un valor cercano a 1 (ej. 0.7, 0.8, 0.9) buscará las áreas más intensas.
-# Puedes ajustarlo según qué tan "fuerte" quieras que sea la anomalía.
-strong_anomaly_region_threshold = 0.75 # Ajusta este valor (ej. 0.7, 0.8, 0.9)
+end_time_recabado = time.time()
+print(f"Tiempo de recabado de puntos del 1% más anómalo: {end_time_recabado - start_time_recabado:.4f} segundos")
 
-# Crea una máscara binaria donde los píxeles superan el umbral
+# --- 2. Detección y visualización de regiones de anomalía "fuertes" (con centroides) ---
+
+# Tiempo específico para el cálculo de regiones fuertes
+start_time_calc_strong_regions = time.time()
+
+strong_anomaly_region_threshold = 0.75
+min_region_pixel_area = 50
+
 binary_strong_anomaly_map = anomaly_map_final > strong_anomaly_region_threshold
 
-# Asegúrate de que la máscara binaria no esté vacía antes de intentar etiquetar
-if not np.any(binary_strong_anomaly_map):
-    print(f"No se encontraron píxeles por encima del umbral de {strong_anomaly_region_threshold} para regiones fuertes de anomalía. Reduce el umbral si es necesario.")
-else:
-    # Etiquetar las regiones conectadas en la máscara binaria
-    # Cada región conectada tendrá un ID único (ej. 1, 2, 3...)
+detected_strong_anomaly_centroids = []
+
+if np.any(binary_strong_anomaly_map):
     labeled_anomaly_regions = measure.label(binary_strong_anomaly_map)
-
-    # Obtener propiedades de cada región, como el bounding box
-    # 'bbox' devuelve (min_row, min_col, max_row, max_col)
-    # 'area' es el número de píxeles en la región
     region_properties = measure.regionprops(labeled_anomaly_regions)
-
-    detected_strong_anomaly_regions = []
-
-    # Filtra las regiones por un tamaño mínimo (opcional, para evitar ruido)
-    min_region_pixel_area = 50 # Tamaño mínimo de píxeles para considerar una región (ajusta si es necesario)
-
-    print(f"Analizando {len(region_properties)} regiones conectadas antes de filtrar.")
     
     for region in region_properties:
         if region.area >= min_region_pixel_area:
-            # bbox de skimage es (min_row, min_col, max_row, max_col)
-            min_y_at_input_size, min_x_at_input_size, max_y_at_input_size, max_x_at_input_size = region.bbox
+            centroid_y_at_input_size, centroid_x_at_input_size = region.centroid
 
-            # Escalar las coordenadas al tamaño de la imagen original
-            original_img_width, original_img_height = query_img_pil.size
-            scale_x = original_img_width / input_size
-            scale_y = original_img_height / input_size
+            scaled_centroid_x = int(centroid_x_at_input_size * scale_x)
+            scaled_centroid_y = int(centroid_y_at_input_size * scale_y)
 
-            scaled_min_x = int(min_x_at_input_size * scale_x)
-            scaled_min_y = int(min_y_at_input_size * scale_y)
-            scaled_max_x = int(max_x_at_input_size * scale_x)
-            scaled_max_y = int(max_y_at_input_size * scale_y)
+            detected_strong_anomaly_centroids.append((scaled_centroid_x, scaled_centroid_y))
 
-            # Guardar el bounding box como (x_start, y_start, width, height) para matplotlib.patches.Rectangle
-            region_width = scaled_max_x - scaled_min_x
-            region_height = scaled_max_y - scaled_min_y
+end_time_calc_strong_regions = time.time()
+print(f"Tiempo de cálculo de regiones fuertes: {end_time_calc_strong_regions - start_time_calc_strong_regions:.4f} segundos")
 
-            # Calcular el centroide de la región (opcional, si quieres un punto en el centro de la región)
-            # centroid_y_at_input_size, centroid_x_at_input_size = region.centroid
-            # scaled_centroid_x = int(centroid_x_at_input_size * scale_x)
-            # scaled_centroid_y = int(centroid_y_at_input_size * scale_y)
+# Plotting de regiones fuertes
+if len(detected_strong_anomaly_centroids) > 0:
+    # No prints for plots
+    plt.figure(figsize=(10, 8))
+    plt.imshow(query_img_pil)
+    plt.title(f'Imagen de Consulta con Centroides de Regiones Fuertes (Q-score: {q_score:.2f})')
+    plt.axis('off')
 
+    x_coords_to_draw_strong = [p[0] for p in detected_strong_anomaly_centroids]
+    y_coords_to_draw_strong = [p[1] for p in detected_strong_anomaly_centroids]
+    plt.scatter(x_coords_to_draw_strong, y_coords_to_draw_strong,
+                color='lime', s=200, marker='X', linewidth=2, edgecolors='black',
+                label=f'Centroides de {len(detected_strong_anomaly_centroids)} Regiones Fuertes')
+    plt.legend()
 
-            detected_strong_anomaly_regions.append({
-                'bbox': (scaled_min_x, scaled_min_y, region_width, region_height),
-                # 'centroid': (scaled_centroid_x, scaled_centroid_y), # Descomenta si necesitas el centroide
-                'area_pixels': region.area # Área en la resolución del heatmap
-            })
+    strong_regions_points_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_centroids_overlay.png')
+    plt.tight_layout()
+    plt.savefig(strong_regions_points_output_filename)
+    plt.close()
 
-    print(f"Se encontraron {len(detected_strong_anomaly_regions)} regiones de anomalía 'fuertes' (área >= {min_region_pixel_area} píxeles).")
-    if len(detected_strong_anomaly_regions) > 0:
-        print(f"Ejemplo de regiones fuertes (bbox): {detected_strong_anomaly_regions[0]['bbox']}")
-    else:
-        print("No se encontraron regiones fuertes de anomalía después de filtrar por área.")
-
-
-    # --- Visualización de las regiones fuertes de anomalía ---
-    if len(detected_strong_anomaly_regions) > 0:
-        plt.figure(figsize=(10, 8))
-        plt.imshow(query_img_pil)
-        plt.title(f'Imagen de Consulta con Regiones Fuertes de Anomalía (Q-score: {q_score:.2f})')
-        plt.axis('off')
-
-        ax = plt.gca() # Obtener el eje actual de matplotlib
-        for i, region_info in enumerate(detected_strong_anomaly_regions):
-            bbox = region_info['bbox']
-            rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2], bbox[3],
-                                     linewidth=3, edgecolor='lime', facecolor='none',
-                                     linestyle='-', alpha=0.9) # Rectángulos verdes sólidos
-            ax.add_patch(rect)
-            # Opcional: Dibuja un punto en el centro de la región
-            # if 'centroid' in region_info:
-            #     plt.scatter(region_info['centroid'][0], region_info['centroid'][1],
-            #                 color='cyan', s=200, marker='X', linewidth=2, edgecolors='black', label='Centroide')
-
-        # Leyenda para los rectángulos
-        ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
-        plt.legend()
+# --------------------------------------------------------------------------------------
+end_time_all_plotting = time.time()
+print(f"Tiempo total para procesar y dibujar conjuntos de puntos: {end_time_all_plotting - start_time_all_plotting:.4f} segundos")
+# --------------------------------------------------------------------------------------
 
 
-        strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay.png')
-        plt.tight_layout()
-        plt.savefig(strong_regions_overlay_output_filename)
-        print(f"Plot de regiones fuertes de anomalía guardado en: {strong_regions_overlay_output_filename}")
-        plt.close()
-    else:
-        print("No se generó el plot de regiones fuertes de anomalía porque no se detectaron regiones válidas.")
-
-### AÑADIDO: FIN DEL BLOQUE DE DETECCIÓN DE REGIONES FUERTES DE ANOMALÍA ###
-
-
-
-
-end_time_point_heatmap = time.time()
-### AÑADIDO: FIN DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN REVISADA ###
-print(f"Tiempo para generar el heatmap de puntos: {end_time_point_heatmap - start_time_point_heatmap:.4f} segundos")
-### AÑADIDO: FIN DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN (CON ESCALADO) ###
 
 
 ##################################
