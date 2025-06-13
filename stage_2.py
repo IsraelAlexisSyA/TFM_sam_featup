@@ -70,7 +70,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/000.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/good/012.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -212,7 +212,7 @@ plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
 plt.colorbar(label='Puntuación de Anomalía Normalizada')
 plt.axis('off')
 
-heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_crack_000.png')
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_good_012.png')
 plt.tight_layout()
 plt.savefig(heatmap_output_filename)
 print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
@@ -225,48 +225,46 @@ end_time_heatmap = time.time()
 print(f"Tiempo para generar el mapa de calor: {end_time_heatmap - start_time_heatmap:.4f} segundos")
 
 ###########################################################################
-
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 from PIL import Image
 from skimage import measure # Para componentes conectados y propiedades de región
+import matplotlib.patches as patches # Para dibujar rectángulos
 import time # Asegúrate de importar time
 
 # --- Variables de configuración y resultados previos (ejemplo, asegúrate de que existen en tu script principal) ---
-# ... (asegúrate que todas las variables necesarias como anomaly_map_final, query_img_pil, etc. están definidas) ...
+# anomaly_map_final (el heatmap normalizado de 0 a 1)
+# query_img_pil (la imagen original PIL)
+# plot_save_directory_on_server (directorio donde guardar los plots)
+# input_size (el tamaño al que se escaló la imagen para DINOv2 y el heatmap, ej. 224)
+# q_score (la puntuación general de la imagen)
+# patch_anomaly_scores (array 1D con las distancias de anomalía por parche)
+# H_prime, W_prime (dimensiones del mapa de características LR, ej. 16, 16)
+# BACKBONE_PATCH_SIZE (ej. 14 para DINOv2)
+
 
 # --------------------------------------------------------------------------------------
-# Tiempo total del proceso de puntos/regiones (incluyendo TODOS los plots)
+# Tiempo total del proceso de detección y visualización de regiones
 start_time_all_plotting = time.time()
 # --------------------------------------------------------------------------------------
 
 
-# --- 1. Visualización de los puntos del 1% más anómalo ---
+# --- Detección y visualización de regiones de anomalía "fuertes" (con rectángulos) ---
 
-start_time_recabado = time.time()
-num_top_patches_to_consider = int(len(patch_anomaly_scores) * 0.01)
-if num_top_patches_to_consider == 0 and len(patch_anomaly_scores) > 0:
-    num_top_patches_to_consider = 1
+start_time_calc_strong_regions = time.time() # Inicio del temporizador para el cálculo de regiones fuertes
 
-original_img_width, original_img_height = query_img_pil.size
-scale_x = original_img_width / input_size
-scale_y = original_img_height / input_size
-
-end_time_recabado = time.time()
-print(f"Tiempo de recabado de puntos del 1% más anómalo: {end_time_recabado - start_time_recabado:.4f} segundos")
-
-# --- 2. Detección y visualización de regiones de anomalía "fuertes" (con centroides) ---
-
-# Tiempo específico para el cálculo de regiones fuertes
-start_time_calc_strong_regions = time.time()
-
-strong_anomaly_region_threshold = 0.75
-min_region_pixel_area = 50
+strong_anomaly_region_threshold = 0.75 # Ajusta este valor para definir qué es una anomalía "fuerte"
+min_region_pixel_area = 50 # Tamaño mínimo de píxeles para considerar una región (en la resolución del heatmap)
 
 binary_strong_anomaly_map = anomaly_map_final > strong_anomaly_region_threshold
 
-detected_strong_anomaly_centroids = []
+detected_strong_anomaly_regions = [] # Lista para guardar los bounding boxes de las regiones detectadas
+
+# Calcula factores de escala (necesarios si no los tienes calculados previamente en el script principal)
+original_img_width, original_img_height = query_img_pil.size
+scale_x = original_img_width / input_size
+scale_y = original_img_height / input_size
 
 if np.any(binary_strong_anomaly_map):
     labeled_anomaly_regions = measure.label(binary_strong_anomaly_map)
@@ -274,42 +272,55 @@ if np.any(binary_strong_anomaly_map):
     
     for region in region_properties:
         if region.area >= min_region_pixel_area:
-            centroid_y_at_input_size, centroid_x_at_input_size = region.centroid
+            # bbox de skimage es (min_row, min_col, max_row, max_col)
+            min_y_at_input_size, min_x_at_input_size, max_y_at_input_size, max_x_at_input_size = region.bbox
 
-            scaled_centroid_x = int(centroid_x_at_input_size * scale_x)
-            scaled_centroid_y = int(centroid_y_at_input_size * scale_y)
+            scaled_min_x = int(min_x_at_input_size * scale_x)
+            scaled_min_y = int(min_y_at_input_size * scale_y)
+            scaled_max_x = int(max_x_at_input_size * scale_x)
+            scaled_max_y = int(max_y_at_input_size * scale_y)
 
-            detected_strong_anomaly_centroids.append((scaled_centroid_x, scaled_centroid_y))
+            # Guardar el bounding box como (x_start, y_start, width, height) para matplotlib.patches.Rectangle
+            region_width = scaled_max_x - scaled_min_x
+            region_height = scaled_max_y - scaled_min_y
 
-end_time_calc_strong_regions = time.time()
+            detected_strong_anomaly_regions.append({
+                'bbox': (scaled_min_x, scaled_min_y, region_width, region_height),
+                'area_pixels': region.area
+            })
+
+end_time_calc_strong_regions = time.time() # Fin del temporizador para el cálculo de regiones fuertes
 print(f"Tiempo de cálculo de regiones fuertes: {end_time_calc_strong_regions - start_time_calc_strong_regions:.4f} segundos")
 
-# Plotting de regiones fuertes
-if len(detected_strong_anomaly_centroids) > 0:
-    # No prints for plots
+# Plotting de regiones fuertes (con rectángulos)
+if len(detected_strong_anomaly_regions) > 0:
     plt.figure(figsize=(10, 8))
     plt.imshow(query_img_pil)
-    plt.title(f'Imagen de Consulta con Centroides de Regiones Fuertes (Q-score: {q_score:.2f})')
+    plt.title(f'Imagen de Consulta con Regiones Fuertes de Anomalía (Q-score: {q_score:.2f})')
     plt.axis('off')
 
-    x_coords_to_draw_strong = [p[0] for p in detected_strong_anomaly_centroids]
-    y_coords_to_draw_strong = [p[1] for p in detected_strong_anomaly_centroids]
-    plt.scatter(x_coords_to_draw_strong, y_coords_to_draw_strong,
-                color='lime', s=200, marker='X', linewidth=2, edgecolors='black',
-                label=f'Centroides de {len(detected_strong_anomaly_centroids)} Regiones Fuertes')
+    ax = plt.gca() # Obtener el eje actual de matplotlib
+    for region_info in detected_strong_anomaly_regions:
+        bbox = region_info['bbox']
+        rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2], bbox[3],
+                                 linewidth=3, edgecolor='lime', facecolor='none',
+                                 linestyle='-', alpha=0.9) # Rectángulos verdes sólidos
+        ax.add_patch(rect)
+    
+    # Leyenda para los rectángulos
+    ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
     plt.legend()
 
-    strong_regions_points_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_centroids_overlay.png')
+
+    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_good_012.png')
     plt.tight_layout()
-    plt.savefig(strong_regions_points_output_filename)
+    plt.savefig(strong_regions_overlay_output_filename)
     plt.close()
 
 # --------------------------------------------------------------------------------------
 end_time_all_plotting = time.time()
-print(f"Tiempo total para procesar y dibujar conjuntos de puntos: {end_time_all_plotting - start_time_all_plotting:.4f} segundos")
+print(f"Tiempo total para procesar y dibujar las regiones: {end_time_all_plotting - start_time_all_plotting:.4f} segundos")
 # --------------------------------------------------------------------------------------
-
-
 
 
 ##################################
@@ -992,7 +1003,7 @@ class ObjectMatchingModule(nn.Module):
         return P, P_augmented_full
 
 # --- Uso del módulo de coincidencia ---
-superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"
+superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"# 
 
 object_matching_module = ObjectMatchingModule(
     superglue_weights_path=superglue_weights_path,
@@ -1080,7 +1091,7 @@ for idx in range(M):
         print(f"Objeto {idx} asignado a un objeto real. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_000.png') #########################################################################################
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_good_012.png') #########################################################################################
 ###################                                                            ###########################################################################################################
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
@@ -1424,15 +1435,15 @@ matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full
 )
 
 # 3. Plot the final anomaly map (General)
-output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_crack_000.png')
+output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_good_012.png')
 plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_full_anomaly_map_filename, title="Mapa de Anomalías General")
 
 # 4. Plot the Matched Anomaly Map
-output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_crack_000.png')
+output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_good_012.png')
 plot_anomaly_map(matched_anomaly_map, image_for_sam_np, save_path=output_matched_anomaly_map_filename, title="Mapa de Anomalías (Objetos Emparejados)")
 
 # 5. Plot the Unmatched Anomaly Map
-output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_crack_000.png')
+output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_good_012.png')
 plot_anomaly_map(unmatched_anomaly_map, image_for_sam_np, save_path=output_unmatched_anomaly_map_filename, title="Mapa de Anomalías (Objetos No Emparejados)")
 
 print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
