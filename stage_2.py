@@ -70,7 +70,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/print/001.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/000.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -212,7 +212,7 @@ plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
 plt.colorbar(label='Puntuación de Anomalía Normalizada')
 plt.axis('off')
 
-heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_print_001.png')
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_crack_000.png')
 plt.tight_layout()
 plt.savefig(heatmap_output_filename)
 print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
@@ -221,10 +221,100 @@ plt.close()
 print("\n--- ¡Generación del mapa de calor y q-score completada! ---")
 
 
-
-
 end_time_heatmap = time.time()
 print(f"Tiempo para generar el mapa de calor: {end_time_heatmap - start_time_heatmap:.4f} segundos")
+
+#
+start_time_point_heatmap = time.time()
+# Suponiendo que anomaly_map_final ya ha sido calculado
+# y que query_img_pil está cargada.
+# También que H_prime, W_prime, BACKBONE_PATCH_SIZE, input_size están definidos.
+
+# Las variables clave del bloque anterior que ya tienes son:
+# - patch_anomaly_scores (array 1D con las distancias de anomalía por parche)
+# - query_img_pil (la imagen PIL original de consulta)
+# - plot_save_directory_on_server
+
+### AÑADIDO: INICIO DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN (CON ESCALADO) ###
+
+# --- Imprimir el shape del mapa de calor final para verificar ---
+print(f"\nShape del anomaly_map_final: {anomaly_map_final.shape}")
+print(f"Dimensiones de la imagen original (query_img_pil): {query_img_pil.size}") # (width, height)
+
+# Obtener las dimensiones originales de la imagen (width, height)
+original_img_width, original_img_height = query_img_pil.size
+
+# Calcular factores de escala
+# input_size (ej. 224) es la dimensión a la que se escaló para DINOv2 y heatmap.
+# original_img_width/height es la dimensión real de la imagen.
+scale_x = original_img_width / input_size
+scale_y = original_img_height / input_size
+
+# --- 4. Encontrar y visualizar los puntos del 1% más anómalo ---
+
+# Obtener los índices de los parches con las puntuaciones más altas
+num_top_patches_to_consider = int(len(patch_anomaly_scores) * 0.01)
+if num_top_patches_to_consider == 0 and len(patch_anomaly_scores) > 0:
+    num_top_patches_to_consider = 1
+
+top_1_percent_patch_indices = np.argsort(patch_anomaly_scores)[-num_top_patches_to_consider:]
+end_time_point_heatmap = time.time()
+# Para visualizar un número fijo de puntos, si el 1% es mayor que ese número.
+max_points_to_draw = 10 # Puedes ajustar este número
+indices_for_drawing = top_1_percent_patch_indices[-min(len(top_1_percent_patch_indices), max_points_to_draw):]
+
+anomalous_pixel_points = [] # Lista para guardar los puntos (x, y) ya escalados
+
+print(f"\nIdentificando y visualizando hasta {max_points_to_draw} puntos más anómalos (del top {num_top_patches_to_consider} parches):")
+
+# Mapear los índices de parches a coordenadas de píxel en la imagen original (escaladas)
+for patch_idx in indices_for_drawing:
+    # Convertir el índice lineal del parche a coordenadas (fila_parche, columna_parche)
+    row_patch = patch_idx // W_prime
+    col_patch = patch_idx % W_prime
+
+    # Calcular la coordenada del centro del parche en píxeles de la resolución DINOv2 (input_size)
+    center_x_at_input_size = col_patch * BACKBONE_PATCH_SIZE + BACKBONE_PATCH_SIZE / 2
+    center_y_at_input_size = row_patch * BACKBONE_PATCH_SIZE + BACKBONE_PATCH_SIZE / 2
+
+    # Escalar las coordenadas al tamaño de la imagen original
+    scaled_center_x_pixel = int(center_x_at_input_size * scale_x)
+    scaled_center_y_pixel = int(center_y_at_input_size * scale_y)
+
+    anomalous_pixel_points.append((scaled_center_x_pixel, scaled_center_y_pixel))
+    # print(f"Parche (fila,col): ({row_patch},{col_patch}) -> Centro Pixel (x,y) @ {input_size}: ({center_x_at_input_size:.2f},{center_y_at_input_size:.2f}) -> Escalado (x,y) @ {original_img_width}x{original_img_height}: ({scaled_center_x_pixel},{scaled_center_y_pixel}) - Score: {patch_anomaly_scores[patch_idx]:.4f}")
+
+print(f"Se encontraron {len(anomalous_pixel_points)} puntos anómalos principales para dibujar.")
+if len(anomalous_pixel_points) > 0:
+    print(f"Ejemplo de puntos anómalos (x,y): {anomalous_pixel_points[:5]}")
+else:
+    print("No hay suficientes parches anómalos para dibujar puntos.")
+
+# --- Visualización de los puntos anómalos ---
+plt.figure(figsize=(10, 8))
+plt.imshow(query_img_pil) # Dibuja sobre la imagen original de tamaño completo
+plt.title(f'Imagen de Consulta con Puntos Top Anomalías (Q-score: {q_score:.2f})')
+plt.axis('off')
+
+# Dibujar círculos (o puntos) en las coordenadas encontradas
+if len(anomalous_pixel_points) > 0:
+    x_coords_to_draw = [p[0] for p in anomalous_pixel_points]
+    y_coords_to_draw = [p[1] for p in anomalous_pixel_points]
+    plt.scatter(x_coords_to_draw, y_coords_to_draw,
+                color='red', edgecolors='yellow', s=100, alpha=0.8, linewidth=2, marker='o',
+                label=f'Top {len(anomalous_pixel_points)} Puntos Anómalos')
+    plt.legend()
+
+points_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_points_overlay_crack_000.png')
+plt.tight_layout()
+plt.savefig(points_overlay_output_filename)
+print(f"Plot de puntos top anomalías guardado en: {points_overlay_output_filename}")
+plt.close()
+
+print(f"Tiempo para generar el heatmap de puntos: {end_time_point_heatmap - start_time_point_heatmap:.4f} segundos")
+### AÑADIDO: FIN DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN (CON ESCALADO) ###
+
+
 ##################################
 
 # --- Función para buscar imágenes similares usando KNN (OPTIMIZADA) ---
@@ -993,7 +1083,7 @@ for idx in range(M):
         print(f"Objeto {idx} asignado a un objeto real. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_print_001.png') #########################################################################################
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_000.png') #########################################################################################
 ###################                                                            ###########################################################################################################
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
@@ -1337,15 +1427,15 @@ matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full
 )
 
 # 3. Plot the final anomaly map (General)
-output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_print_001.png')
+output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_crack_000.png')
 plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_full_anomaly_map_filename, title="Mapa de Anomalías General")
 
 # 4. Plot the Matched Anomaly Map
-output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_print_001.png')
+output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_crack_000.png')
 plot_anomaly_map(matched_anomaly_map, image_for_sam_np, save_path=output_matched_anomaly_map_filename, title="Mapa de Anomalías (Objetos Emparejados)")
 
 # 5. Plot the Unmatched Anomaly Map
-output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_print_001.png')
+output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_crack_000.png')
 plot_anomaly_map(unmatched_anomaly_map, image_for_sam_np, save_path=output_unmatched_anomaly_map_filename, title="Mapa de Anomalías (Objetos No Emparejados)")
 
 print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
