@@ -16,6 +16,11 @@ from featup.plotting import plot_feats # Asegúrate de que esta importación sea
 from sklearn.neighbors import NearestNeighbors
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import pdist
+#import seaborn as sns
+from sklearn.cluster import KMeans
+
 
 
 # --- Configuración Inicial ---
@@ -63,14 +68,13 @@ except Exception as e:
     print(f"Ocurrió un error al cargar o procesar los archivos del coreset relevante: {e}")
     exit()
 
-
 # Define donde quieres guardar el plot
-plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_2'# Nueva carpeta para esta etapa
+plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_5'# Nueva carpeta para esta etapa
 output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_plot.png')
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/good/012.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/cut/010.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -99,6 +103,7 @@ transform = T.Compose([
 def extract_dinov2_features_lr(image_path, model, image_transform, device):
     """Extrae características de baja resolución de DINOv2 usando la transformación dada."""
     input_tensor = image_transform(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
+    print(f"Shape del tensor de entrada: {input_tensor.shape}")
     with torch.no_grad():
         features = model(input_tensor)
     return features.cpu() # Mantener en CPU hasta que sea necesario
@@ -115,7 +120,7 @@ start_time_heatmap = time.time()
 ### AÑADIDO: Cálculo de distancias a nivel de parche y generación del mapa de calor ###
 
 # Aplanar las características de la imagen de consulta para obtener vectores de parches
-# query_lr_features_map tiene forma (1, C, H', W')
+# query_lr_features tiene forma (1, C, H', W')
 query_patches_flat = query_lr_features.squeeze(0).permute(1, 2, 0).reshape(-1, query_lr_features.shape[1])
 # query_patches_flat ahora tiene forma (H'*W', C) => (256, 384) para DINOv2-S/14
 print(f"Dimensiones de parches de consulta aplanados: {query_patches_flat.shape}")
@@ -128,9 +133,9 @@ print("Cargando el banco de memoria (coreset_features)...")
 coreset_features = None # Este será el tensor (Num_Coreset_Patches, C)
 
 try:
-    # --- ESTA ES LA LÍNEA QUE CARGA coreset_features ---
-    coreset_features = torch.load(template_features_bank_coreset_file).to(device)
-    print(f"Coreset de características (M) cargado. Dimensión: {coreset_features.shape}")
+    # --- CARGA coreset_features ---
+    coreset_features = torch.load(template_features_bank_coreset_file).to(device) 
+    print(f"Coreset de características (M) cargado. Dimensión: {coreset_features.shape}") # esperado(H'*W', C) => (256, 384) => (16*16, 384) para DINOv2-S/14 y (224x224) HxW 
 
 except FileNotFoundError as e:
     print(f"Error al cargar el coreset de características: {e}. Asegúrate de que Stage 1 se haya ejecutado correctamente y el archivo '{template_features_bank_coreset_file}' exista.")
@@ -143,10 +148,11 @@ end_time_coreset_load = time.time()
 print(f"Tiempo para cargar el coreset: {end_time_coreset_load - start_time_coreset_load:.4f} segundos")
 
 
-
 # Mover el coreset a CPU para sklearn, si no quieres usar Faiss/torch.cdist (más complejo)
 coreset_features_cpu = coreset_features.cpu().numpy()
+print(f"Forma del coreset de características en CPU: {coreset_features_cpu.shape}") # (H'*W', C) => (256, 384) para DINOv2-S/14
 query_patches_flat_cpu = query_patches_flat.cpu().numpy()
+print(f"Forma de los parches de consulta aplanados en CPU: {query_patches_flat_cpu.shape}") # (H'*W', C) => (256, 384) para DINOv2-S/14
 
 # 1. Calcular distancias de coseno entre cada parche de consulta y el coreset
 print("\nCalculando distancias de coseno a nivel de parche...")
@@ -156,19 +162,82 @@ start_time_distances = time.time()
 from sklearn.neighbors import NearestNeighbors
 # n_neighbors=1 porque solo queremos la distancia al más cercano
 # metric='cosine' para distancia de coseno
-# algorithm='brute' es simple, para grandes coreset, 'kd_tree' o 'ball_tree' o Faiss son mejores
-nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu)
-distances_to_nn, _ = nn_finder.kneighbors(query_patches_flat_cpu)
+# algorithm='brute' es simple, para grandes coreset, 'kd_tree' o 'ball_tree' o Faiss son mejores           # el modelo conoce las características del coreset
+nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu) #instancia del model adapta neighbors model al conjunto de datos
+distances_to_nn, _ = nn_finder.kneighbors(query_patches_flat_cpu)  # = ()1 pxel tiene un parche y tiene un vector de C (C=384 para DINOv2-S/14)
 # distances_to_nn tendrá forma (H'*W', 1)
 patch_anomaly_scores = distances_to_nn.flatten() # Forma (H'*W',)
+# --- Aplicar Hierarchical Clustering a patch_anomaly_scores ---
+print("\nAplicando Hierarchical Clustering a patch_anomaly_scores...")
+
+# Calcular la matriz de distancias entre los scores
+distance_matrix = pdist(patch_anomaly_scores.reshape(-1, 1), metric='euclidean')
+
+# Generar el linkage matrix para el dendrograma
+linkage_matrix = linkage(distance_matrix, method='ward')
+
+# Visualizar el dendrograma
+plt.figure(figsize=(12, 6))
+dendrogram(linkage_matrix, color_threshold=0.5 * max(linkage_matrix[:, 2]), no_labels=True)
+plt.title("Dendrograma de Clustering Jerárquico (patch_anomaly_scores)")
+plt.xlabel("Índices de Parches")
+plt.ylabel("Distancia Euclidiana")
+
+# Guardar el dendrograma en un archivo
+output_dendrogram_filename = os.path.join(plot_save_directory_on_server, 'patch_anomaly_scores_dendrogram.png')
+plt.tight_layout()
+plt.savefig(output_dendrogram_filename)
+print(f"Dendrograma de clustering jerárquico guardado en: {output_dendrogram_filename}")
+plt.close()
+
+# --- Aplicar K-Means a patch_anomaly_scores ---
+
+# Número de clusters (puedes ajustar este valor según sea necesario)
+num_clusters = 3
+
+# Reshape patch_anomaly_scores para K-Means
+patch_anomaly_scores_reshaped = patch_anomaly_scores.reshape(-1, 1)
+
+# Aplicar K-Means
+kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+kmeans_labels = kmeans.fit_predict(patch_anomaly_scores_reshaped)
+
+# Reshape las etiquetas de los clusters a la forma espacial (H', W')
+kmeans_labels_reshaped = kmeans_labels.reshape(H_prime, W_prime)
+
+# Visualizar los clusters en el mapa de anomalías
+plt.figure(figsize=(10, 8))
+plt.imshow(kmeans_labels_reshaped, cmap='tab10', interpolation='nearest')
+plt.title(f"K-Means Clustering (k={num_clusters}) en patch_anomaly_scores")
+plt.colorbar(label='Cluster ID')
+plt.axis('off')
+
+# Guardar el plot en un archivo
+output_kmeans_plot_filename = os.path.join(plot_save_directory_on_server, 'kmeans_patch_anomaly_scores.png')
+plt.tight_layout()
+plt.savefig(output_kmeans_plot_filename)
+print(f"Plot de K-Means en patch_anomaly_scores guardado en: {output_kmeans_plot_filename}")
+plt.close()
+
+
+
+
+
 end_time_distances = time.time()
 print(f"Tiempo para calcular distancias de parches: {end_time_distances - start_time_distances:.4f} segundos")
 print(f"Forma de las puntuaciones de anomalía de parches: {patch_anomaly_scores.shape}")
+# Imprimir los 5 primeros scores de anomalía de parches
+print("Primeros 5 scores de anomalía de parches:")
+print(patch_anomaly_scores[:5])
+
 
 # 2. Generar el mapa de calor (heatmap)
 # Reorganizar las puntuaciones de los parches a la forma espacial (H', W')
 anomaly_map_lr = patch_anomaly_scores.reshape(H_prime, W_prime)
 print(f"Forma del mapa de anomalías de baja resolución: {anomaly_map_lr.shape}")
+# Imprimir los 2 primeros valores del anomaly_map_lr
+print("Primeros 2 valores del anomaly_map_lr:")
+print(anomaly_map_lr.flatten()[:2])
 
 # Upsampling Bilineal a la resolución de entrada original
 # Convertir a tensor PyTorch, añadir dimensiones de batch y canal, y mover a device
@@ -189,12 +258,170 @@ print(f"Forma del mapa de calor final: {anomaly_map_final.shape}")
 # 3. Calcular el q-score (puntuación a nivel de imagen)
 # Tomar el 1% de las puntuaciones de anomalía de parche más altas
 num_top_patches = int(len(patch_anomaly_scores) * 0.01)
-if num_top_patches == 0 and len(patch_anomaly_scores) > 0: # Asegurarse de tomar al menos 1 si hay parches
+if num_top_patches == 0 and len(patch_anomaly_scores) > 0: # Asegurarse de tomar al menos 1 si hay menos de 100 parches
     num_top_patches = 1
 
-top_anomaly_scores = np.sort(patch_anomaly_scores)[-num_top_patches:]
+top_anomaly_scores = np.sort(patch_anomaly_scores)[-num_top_patches:] # # Tomar el 1% superior
+
+# Imprimir los 5 primeros top scores
+print("Top scores de anomalía (1% superior):")
+print(top_anomaly_scores)
+# Ordenar los patch_anomaly_scores de forma descendente
+sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
+
+
+import numpy as np
+import pywt # Importar la librería PyWavelets
+import matplotlib.pyplot as plt
+import os
+from kneed import KneeLocator # Importar KneeLocator
+# Simulación de plot_save_directory_on_server
+# Reemplaza con tu ruta real donde quieras guardar las imágenes
+#plot_save_directory_on_server = 'plots_wavelet'
+os.makedirs(plot_save_directory_on_server, exist_ok=True)
+
+print("Top scores de anomalía (primeros 12, para referencia):")
+print(sorted_patch_anomaly_scores[:12])
+print(f"Total de scores: {len(sorted_patch_anomaly_scores)}")
+
+
+# --- Aplicar la Transformada Wavelet Discreta (DWT) ---
+# Elegir una wavelet (ej., 'db4' - Daubechies 4, buena para detección de bordes)
+# Nivel de descomposición (cuántas veces se aplica la transformada)
+# Un nivel bajo (ej., 1 o 2) es bueno para capturar cambios bruscos.
+wavelet = 'db4'
+level = 1 # O 2, dependiendo de la granularidad que busques para el cambio brusco
+
+# Realizar la descomposición DWT
+# cA: Coeficientes de aproximación (componentes de baja frecuencia, suavizadas)
+# cD: Coeficientes de detalle (componentes de alta frecuencia, capturan los cambios/singularidades)
+coeffs = pywt.wavedec(sorted_patch_anomaly_scores, wavelet, level=level)
+
+# Extraer los coeficientes de detalle del nivel más fino (cD1)
+# Si level=1, coeffs[1] es cD1
+# Si level=2, coeffs[1] es cD2 (el más fino), coeffs[2] es cD1.
+# Queremos el detalle más fino para cambios bruscos, que está en coeffs[1] si level=1,
+# o coeffs[-level] si usas wavedec y quieres el detalle más alto.
+if level == 1:
+    cD1 = coeffs[1]
+else:
+    # Si level > 1, el coeficiente de detalle más fino es el último en la lista (cD1)
+    cD1 = coeffs[-1]
+
+
+print(f"\nNúmero de coeficientes de detalle (cD1): {len(cD1)}")
+print(f"Los 10 primeros coeficientes de detalle (cD1): {cD1[:10]}")
+
+
+# --- Visualizar los Coeficientes de Detalle (cD1) ---
+plt.figure(figsize=(14, 7))
+
+# Plotear los scores originales
+plt.subplot(2, 1, 1) # 2 filas, 1 columna, primer plot
+plt.plot(sorted_patch_anomaly_scores, label='Scores de Anomalía Ordenados', color='blue')
+plt.title("Scores de Anomalía Ordenados (Mayor a Menor)")
+plt.xlabel("Índice")
+plt.ylabel("Score")
+plt.grid(True)
+plt.legend()
+
+# Plotear los coeficientes de detalle (cD1)
+plt.subplot(2, 1, 2) # Segundo plot
+# Los coeficientes de detalle tienen una longitud diferente a la señal original.
+# Mapeamos sus índices a la señal original para la visualización.
+# La longitud de cD1 es aproximadamente la mitad de la longitud de la señal original.
+x_axis_cD1 = np.linspace(0, len(sorted_patch_anomaly_scores) - 1, len(cD1))
+plt.plot(x_axis_cD1, cD1, label=f'Coeficientes de Detalle (cD1, Wavelet: {wavelet})', color='red')
+plt.title(f"Coeficientes de Detalle (cD1) de la Transformada Wavelet Discreta")
+plt.xlabel("Posición aproximada en la secuencia original")
+plt.ylabel("Amplitud del Coeficiente de Detalle")
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout() # Ajustar el layout para evitar solapamientos
+
+# Guardar el plot
+output_dwt_coeffs_plot_filename = os.path.join(plot_save_directory_on_server, 'dwt_detail_coefficients.png')
+plt.savefig(output_dwt_coeffs_plot_filename)
+print(f"\nPlot de los coeficientes de detalle DWT guardado en: {output_dwt_coeffs_plot_filename}")
+plt.close()
+
+# --- Interpretación Potencial ---
+# Valores absolutos altos en cD1 indican cambios bruscos.
+# La posición de estos picos en cD1 corresponde a la posición del cambio en la señal original.
+# Para distinguir tus casos:
+# - 'Buena' (1/x): Se esperaría un pico de cD1 al principio, que decae rápidamente.
+# - 'Anomalía pequeña/grande' (lineal): Se esperaría un pico de cD1 al principio, pero quizás más sostenido o con una forma diferente.
+# Puedes analizar el valor máximo de cD1 y su decaimiento.
+# Por ejemplo, si los primeros coeficientes de detalle son muy altos, y luego bajan bruscamente,
+# podría indicar esa transición de "pendiente inclinada" a "suave".
+# La "longitud" de la sección empinada se reflejaría en cuántos de los primeros coeficientes de detalle
+# son significativamente grandes.
+exit()
+
+
+
+
+
+
+# Aplicar K-Means con 2 clusters a sorted_patch_anomaly_scores
+num_clusters_kmeans_2 = 2
+kmeans_2 = KMeans(n_clusters=num_clusters_kmeans_2, random_state=42)
+kmeans_2_labels = kmeans_2.fit_predict(sorted_patch_anomaly_scores.reshape(-1, 1))
+
+# Agrupar los datos en variables según las etiquetas de los clusters
+cluster_0_data = sorted_patch_anomaly_scores[kmeans_2_labels == 0]
+cluster_1_data = sorted_patch_anomaly_scores[kmeans_2_labels == 1]
+
+# Visualizar los clusters
+plt.figure(figsize=(10, 6))
+plt.scatter(range(len(cluster_0_data)), cluster_0_data, label='Cluster 0', color='blue')
+plt.scatter(range(len(cluster_0_data), len(cluster_0_data) + len(cluster_1_data)), cluster_1_data, label='Cluster 1', color='orange')
+plt.title("K-Means Clustering (k=2) en sorted_patch_anomaly_scores")
+plt.xlabel("Índice")
+plt.ylabel("Puntuación de Anomalía")
+plt.legend()
+plt.tight_layout()
+
+# Guardar el plot en un archivo
+output_kmeans_2_plot_filename = os.path.join(plot_save_directory_on_server, 'kmeans_2_sorted_patch_anomaly_scores.png')
+plt.savefig(output_kmeans_2_plot_filename)
+print(f"Plot de K-Means con 2 clusters guardado en: {output_kmeans_2_plot_filename}")
+plt.close()
+
+# Imprimir los datos agrupados como vectores
+print("Cluster 0 Data:", cluster_0_data)
+print("Cluster 1 Data:", cluster_1_data)
+# Calcular RMS (Root Mean Square) para Cluster 0
+if len(cluster_0_data) > 0:
+    rms_cluster_0 = np.sqrt(np.mean(np.square(cluster_0_data)))
+    print(f"RMS para Cluster 0: {rms_cluster_0:.4f}")
+else:
+    rms_cluster_0 = 0
+    print("Cluster 0 está vacío. RMS establecido en 0.")
+
+# Calcular AVG (Average) para Cluster 1
+if len(cluster_1_data) > 0:
+    avg_cluster_1 = np.mean(cluster_1_data)
+    print(f"AVG para Cluster 1: {avg_cluster_1:.4f}")
+else:
+    avg_cluster_1 = 0
+    print("Cluster 1 está vacío. AVG establecido en 0.")
+
+# Calcular la diferencia entre RMS de Cluster 0 y AVG de Cluster 1
+difference = rms_cluster_0 - avg_cluster_1
+print(f"Diferencia (RMS Cluster 0 - AVG Cluster 1): {difference:.4f}")
+
+
+print("Sorted patch anomaly scores (descending):")
+print(sorted_patch_anomaly_scores)
+
 q_score = np.mean(top_anomaly_scores)
 print(f"Q-score (promedio del 1% superior de distancias): {q_score:.4f}")
+
+# Determinar si hay anomalía estructural basada en el Q-score
+anomalia_estructural = q_score > 0.27 #aqui es o no Anomalia estructural
+print(f"Anomalía estructural: {'Sí' if anomalia_estructural else 'No'}")
 
 
 # 4. Visualización del mapa de calor
@@ -212,7 +439,7 @@ plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
 plt.colorbar(label='Puntuación de Anomalía Normalizada')
 plt.axis('off')
 
-heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_good_012.png')
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_cut_010.png')
 plt.tight_layout()
 plt.savefig(heatmap_output_filename)
 print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
@@ -223,7 +450,13 @@ print("\n--- ¡Generación del mapa de calor y q-score completada! ---")
 
 end_time_heatmap = time.time()
 print(f"Tiempo para generar el mapa de calor: {end_time_heatmap - start_time_heatmap:.4f} segundos")
+exit( )
+# Salir del script si no se detecta anomalía estructural
+# if not anomalia_estructural:
+#     print("No se detectó anomalía estructural. Saliendo del script.")
+#     exit()
 
+# Visualización de regiones en la imagen de consulta
 ###########################################################################
 import numpy as np
 import matplotlib.pyplot as plt
@@ -288,9 +521,21 @@ if np.any(binary_strong_anomaly_map):
                 'bbox': (scaled_min_x, scaled_min_y, region_width, region_height),
                 'area_pixels': region.area
             })
-
+            
 end_time_calc_strong_regions = time.time() # Fin del temporizador para el cálculo de regiones fuertes
 print(f"Tiempo de cálculo de regiones fuertes: {end_time_calc_strong_regions - start_time_calc_strong_regions:.4f} segundos")
+# Imprimir las regiones detectadas
+print(f"Shape de detected_strong_anomaly_regions: {len(detected_strong_anomaly_regions)}")
+print(f"Tipo de detected_strong_anomaly_regions: {type(detected_strong_anomaly_regions)}")
+print("\n--- Regiones Fuertes de Anomalía Detectadas (Vector Completo) ---")
+print(detected_strong_anomaly_regions)
+print("\n--- Regiones Fuertes de Anomalía Detectadas ---")
+for idx, region in enumerate(detected_strong_anomaly_regions):
+    print(f"Región {idx + 1}:")
+    print(f"  - Bounding Box (x, y, width, height): {region['bbox']}")
+    print(f"  - Área en píxeles: {region['area_pixels']}")
+    
+    
 
 # Plotting de regiones fuertes (con rectángulos)
 if len(detected_strong_anomaly_regions) > 0:
@@ -311,8 +556,7 @@ if len(detected_strong_anomaly_regions) > 0:
     ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
     plt.legend()
 
-
-    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_good_012.png')
+    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_cut_010.png')
     plt.tight_layout()
     plt.savefig(strong_regions_overlay_output_filename)
     plt.close()
@@ -321,7 +565,6 @@ if len(detected_strong_anomaly_regions) > 0:
 end_time_all_plotting = time.time()
 print(f"Tiempo total para procesar y dibujar las regiones: {end_time_all_plotting - start_time_all_plotting:.4f} segundos")
 # --------------------------------------------------------------------------------------
-
 
 ##################################
 
@@ -805,7 +1048,9 @@ for i, similar_hr_feats in enumerate(similar_hr_feats_list):
 
 print("\nProceso de 'Object Feature Map' completado. ¡Ahora tienes los fobj_q y fobj_r listos!")
   
-# -----------3.5.2 Object matching module-----------------
+
+
+# -----------3.5.2 Object matching module----------------------------------------------------------------
 ## Matching
 # --- Definición de la función show_anomalies_on_image ---
 def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_path=None):
@@ -846,10 +1091,12 @@ def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_pat
     plt.show()
     plt.close()
 # --- Fin de la definición de la función show_anomalies_on_image ---
-# --- Nuevas funciones de ploteo para la matriz P y P_augmented_full ---
+
+# --- Funciones de ploteo MODIFICADAS para la matriz P y P_augmented_full ---
 def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=None, title="Matriz de Asignación P"):
     """
-    Visualiza la matriz de asignación P como un mapa de calor.
+    Visualiza la matriz de asignación P como un mapa de calor y muestra los coeficientes
+    de confianza dentro de cada celda.
 
     Args:
         P_matrix (torch.Tensor or np.array): La matriz de asignación (M x N).
@@ -859,10 +1106,9 @@ def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=N
         title (str): Título del plot.
     """
     if isinstance(P_matrix, torch.Tensor):
-        #P_matrix = P_matrix.cpu().numpy()
         P_matrix = P_matrix.detach().cpu().numpy()
 
-    plt.figure(figsize=(P_matrix.shape[1] * 0.8 + 2, P_matrix.shape[0] * 0.8 + 2))
+    plt.figure(figsize=(P_matrix.shape[1] * 1.0 + 2, P_matrix.shape[0] * 1.0 + 2)) # Ajustado figsize
     plt.imshow(P_matrix, cmap='viridis', origin='upper', aspect='auto')
     plt.colorbar(label='Probabilidad de Asignación')
     plt.xticks(np.arange(len(reference_labels)), reference_labels, rotation=45, ha="right")
@@ -870,6 +1116,18 @@ def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=N
     plt.xlabel('Objetos de Referencia')
     plt.ylabel('Objetos de Consulta')
     plt.title(title)
+
+    # Añadir los valores de confianza dentro de cada celda
+    for i in range(P_matrix.shape[0]):
+        for j in range(P_matrix.shape[1]):
+            # Determinar el color del texto basado en el fondo (valor de la celda)
+            # Esto ayuda a la legibilidad: texto blanco sobre fondo oscuro, texto negro sobre fondo claro
+            text_color = 'white' if P_matrix[i, j] < 0.5 else 'black' 
+            plt.text(j, i, f'{P_matrix[i, j]:.3f}',
+                     ha="center", va="center", color=text_color, fontsize=8,
+                     weight='bold' if P_matrix[i, j] > 0.5 else 'normal') # Negrita para valores altos
+
+
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path)
@@ -879,7 +1137,8 @@ def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=N
 
 def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_labels, save_path=None, title="Matriz de Asignación Aumentada (con Trash Bin)"):
     """
-    Visualiza la matriz de asignación aumentada (incluyendo los trash bins) como un mapa de calor.
+    Visualiza la matriz de asignación aumentada (incluyendo los trash bins) como un mapa de calor
+    y muestra los coeficientes de confianza dentro de cada celda.
 
     Args:
         P_augmented_full (torch.Tensor or np.array): La matriz de asignación aumentada ((M+1) x (N+1)).
@@ -889,14 +1148,13 @@ def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_l
         title (str): Título del plot.
     """
     if isinstance(P_augmented_full, torch.Tensor):
-        #P_augmented_full = P_augmented_full.cpu().numpy()
         P_augmented_full = P_augmented_full.detach().cpu().numpy()
 
     # Añadir etiquetas para los trash bins
     full_query_labels = [f"Q_{i}" for i in query_labels] + ["Trash Bin (Q)"]
     full_reference_labels = [f"R_{i}" for i in reference_labels] + ["Trash Bin (R)"]
 
-    plt.figure(figsize=(P_augmented_full.shape[1] * 0.8 + 2, P_augmented_full.shape[0] * 0.8 + 2))
+    plt.figure(figsize=(P_augmented_full.shape[1] * 1.0 + 2, P_augmented_full.shape[0] * 1.0 + 2)) # Ajustado figsize
     plt.imshow(P_augmented_full, cmap='viridis', origin='upper', aspect='auto')
     plt.colorbar(label='Probabilidad de Asignación')
     plt.xticks(np.arange(len(full_reference_labels)), full_reference_labels, rotation=45, ha="right")
@@ -904,6 +1162,16 @@ def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_l
     plt.xlabel('Objetos de Referencia y Trash Bin')
     plt.ylabel('Objetos de Consulta y Trash Bin')
     plt.title(title)
+
+    # Añadir los valores de confianza dentro de cada celda
+    for i in range(P_augmented_full.shape[0]):
+        for j in range(P_augmented_full.shape[1]):
+            text_color = 'white' if P_augmented_full[i, j] < 0.5 else 'black'
+            plt.text(j, i, f'{P_augmented_full[i, j]:.3f}',
+                     ha="center", va="center", color=text_color, fontsize=8,
+                     weight='bold' if P_augmented_full[i, j] > 0.5 else 'normal')
+
+
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path)
@@ -911,7 +1179,7 @@ def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_l
     plt.show()
     plt.close()
 
-# --- Fin de las nuevas funciones de ploteo ---
+# --- Fin de las funciones de ploteo MODIFICADAS ---
 
 ## Matching-continue---
 ## Matching
@@ -938,12 +1206,15 @@ def max_similarities(query_feats, candidate_feats):
 
 # --- Optimal Matching Module ---
 class ObjectMatchingModule(nn.Module):
-    def __init__(self, superglue_weights_path=None, sinkhorn_iterations=100, sinkhorn_epsilon=0.1):
+    def __init__(self, superglue_weights_path=None, sinkhorn_iterations=100, sinkhorn_epsilon=0.1, custom_z=None):
         super(ObjectMatchingModule, self).__init__()
         self.sinkhorn_iterations = sinkhorn_iterations
         self.sinkhorn_epsilon = sinkhorn_epsilon
 
-        if superglue_weights_path and os.path.exists(superglue_weights_path):
+        if custom_z is not None: # Usar custom_z si se proporciona
+            self.z = nn.Parameter(torch.tensor(custom_z, dtype=torch.float32))
+            print(f"Parámetro 'z' inicializado con valor personalizado: {self.z.item():.4f}")
+        elif superglue_weights_path and os.path.exists(superglue_weights_path):
             try:
                 state_dict = torch.load(superglue_weights_path, map_location=device)
                 if 'bin_score' in state_dict:
@@ -953,7 +1224,6 @@ class ObjectMatchingModule(nn.Module):
                 else:
                     print(f"Advertencia: 'z' (bin_score) no encontrado en {superglue_weights_path}. Inicializando con valor predeterminado.")
                     z_value = 0.5
-                                                #aqui puedes variar 0.5 por ej.
                 self.z = nn.Parameter(torch.tensor(z_value, dtype=torch.float32))
                 print(f"Parámetro 'z' cargado de SuperGlue: {self.z.item():.4f}")
 
@@ -974,7 +1244,7 @@ class ObjectMatchingModule(nn.Module):
                    torch.empty(M+1, N+1, device=d_M_q.device)
 
         score_matrix = torch.mm(d_M_q, d_N_r.T)
-        print(f"Matriz de similitud inicial (MxN): {score_matrix.shape}")
+        # print(f"Matriz de similitud inicial (MxN): {score_matrix.shape}")
         # print("score_matrix:\n", score_matrix) # Descomentar para ver la matriz
 
         S_augmented = torch.zeros((M + 1, N + 1), device=d_M_q.device, dtype=d_M_q.dtype)
@@ -982,33 +1252,36 @@ class ObjectMatchingModule(nn.Module):
         S_augmented[:M, N] = self.z # Última columna (trash bin para query)
         S_augmented[M, :N] = self.z # Última fila (trash bin para reference)
         S_augmented[M, N] = self.z # Esquina inferior derecha (trash bin vs trash bin)
-        print(f"Matriz S_augmented (M+1 x N+1): {S_augmented.shape}")
+        # print(f"Matriz S_augmented (M+1 x N+1): {S_augmented.shape}")
         # print("S_augmented:\n", S_augmented) # Descomentar para ver la matriz
 
         K = torch.exp(S_augmented / self.sinkhorn_epsilon)
-        # print("K (exp(S/epsilon)) antes de Sinkhorn:\n", K) # Descomentar para ver
+        print("K (exp(S/epsilon)) antes de Sinkhorn:\n", K) # Descomentar para ver
 
         for i in range(self.sinkhorn_iterations):
             K = K / K.sum(dim=1, keepdim=True) # Normalizar filas
             K = K / K.sum(dim=0, keepdim=True) # Normalizar columnas
-            # print(f"K después de iteración {i+1} de Sinkhorn:\n", K) # Descomentar para ver cada iteración
+            print(f"K después de iteración {i+1} de Sinkhorn:\n", K) # Descomentar para ver cada iteración
 
         P_augmented_full = K
         P = P_augmented_full[:M, :N] # La matriz de asignación sin trash bins
-        print(f"Matriz de asignación P (MxN): {P.shape}")
-        print("P:\n", P) # Print de la matriz de asignación P
-        print(f"Matriz de asignación P_augmented_full (M+1 x N+1): {P_augmented_full.shape}")
-        print("P_augmented_full:\n", P_augmented_full) # Print de la matriz de asignación completa
+        # print(f"Matriz de asignación P (MxN): {P.shape}")
+        # print("P:\n", P) # Print de la matriz de asignación P
+        # print(f"Matriz de asignación P_augmented_full (M+1 x N+1): {P_augmented_full.shape}")
+        # print("P_augmented_full:\n", P_augmented_full) # Print de la matriz de asignación completa
 
         return P, P_augmented_full
 
 # --- Uso del módulo de coincidencia ---
-superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"# 
-
+superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"#
+# Para probar el ajuste de `self.z`, puedes pasar `custom_z` aquí:
+# Prueba con valores como 0.0, 0.1, 0.2, etc.
 object_matching_module = ObjectMatchingModule(
     superglue_weights_path=superglue_weights_path,
-    sinkhorn_iterations=100,
-    sinkhorn_epsilon=0.1
+    sinkhorn_iterations=30,  #100
+    sinkhorn_epsilon=0.1,
+    custom_z=0.9 #0.9 # <--- ¡Modifica este valor para tus pruebas! 1.5 a 4 funciona como 2.32 de superglue 1.1 ya varia 0.8
+    # bajar eleva el trash bin, subir lo baja [0.6 -- trashR 0.35] mal resultado
 ).to(device)
 
 
@@ -1044,7 +1317,7 @@ for i, d_N_r_current_image in enumerate(all_fobj_r_norm_list): # Cambié el nomb
 
 
 # --- Lógica de Detección de Anomalías ---
-# fobj_q_norm:(magnitud 1) normalizado a lo largo de una dim=1: en las columnas p=2: L2 distance 
+# fobj_q_norm:(magnitud 1) normalizado a lo largo de una dim=1: en las columnas p=2: L2 distance
 M = fobj_q_norm.shape[0]#devuelve el número de filas en el tensor que es el número de objetos de consulta total
 # la suma de sus cuadrados es 1.0; cada vector de características es escalado para que su norma L2 sea 1.0, vector unitario, valores individuales no restringidos a [0,1]
 is_matched_to_real_object = torch.zeros(M, dtype=torch.bool, device=device)
@@ -1070,9 +1343,9 @@ for P_current, P_augmented_current in zip(P_matrices, P_augmented_full_matrices)
         if max_conf_to_real_ref[q_idx] > best_match_confidence_overall[q_idx]: #actualizar al maximo global best match iterando
             best_match_confidence_overall[q_idx] = max_conf_to_real_ref[q_idx]
 
-        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]: #actualizar al maximo global bin 
+        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]: #actualizar al maximo global bin
              best_match_to_trash_bin_confidence[q_idx] = conf_to_trash_bin_current[q_idx]
-                                       # anomaly_detection_threshold
+                                        # anomaly_detection_threshold
         if max_conf_to_real_ref[q_idx] > anomaly_detection_threshold and \
            max_conf_to_real_ref[q_idx] > conf_to_trash_bin_current[q_idx]:
             is_matched_to_real_object[q_idx] = True
@@ -1091,12 +1364,10 @@ for idx in range(M):
         print(f"Objeto {idx} asignado a un objeto real. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_good_012.png') #########################################################################################
-###################                                                            ###########################################################################################################
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_good_000.png')
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
 print(f"Plot de anomalías guardado en: {output_anomalies_query_plot_om}")
-
 
 
 
@@ -1113,6 +1384,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import time
+from scipy.cluster.hierarchy import dendrogram, linkage
+from scipy.spatial.distance import pdist
+import seaborn as sns
+from sklearn.cluster import KMeans
 
 # Asumiendo que 'device' y otras variables globales están definidas en tu script principal
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1415,7 +1690,7 @@ def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de An
 ref_pixel_distributions = build_reference_pixel_distributions(all_fobj_r_list, TARGET_MASK_H, TARGET_MASK_W)
 
 # 1.2. Create the full anomaly map, and now also separate matched/unmatched maps
-GLOBAL_ANOMALY_SCORE_CEILING = 35.0 # <--- ¡AJUSTA ESTE VALOR! Prueba con 20.0, 10.0, etc.
+GLOBAL_ANOMALY_SCORE_CEILING = 30 # <--- ¡AJUSTA ESTE VALOR! Prueba con 20.0, 10.0, etc. eleva el valor de las confianzas e inmoviliza a trash
 matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full_anomaly_map(
     M, masks_data, P_matrices, P_augmented_full_matrices,
     fobj_q, all_fobj_r_list,
@@ -1435,15 +1710,15 @@ matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full
 )
 
 # 3. Plot the final anomaly map (General)
-output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_good_012.png')
+output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_cut_000.png')
 plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_full_anomaly_map_filename, title="Mapa de Anomalías General")
 
 # 4. Plot the Matched Anomaly Map
-output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_good_012.png')
+output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_cut_000.png')
 plot_anomaly_map(matched_anomaly_map, image_for_sam_np, save_path=output_matched_anomaly_map_filename, title="Mapa de Anomalías (Objetos Emparejados)")
 
 # 5. Plot the Unmatched Anomaly Map
-output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_good_012.png')
+output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_cut_000.png')
 plot_anomaly_map(unmatched_anomaly_map, image_for_sam_np, save_path=output_unmatched_anomaly_map_filename, title="Mapa de Anomalías (Objetos No Emparejados)")
 
 print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
