@@ -74,7 +74,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/cut/013.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/hole/000.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -270,6 +270,160 @@ print(top_anomaly_scores)
 sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
 
 
+from scipy.stats import median_abs_deviation
+
+
+
+
+# Data validation
+if not isinstance(sorted_patch_anomaly_scores, np.ndarray) or sorted_patch_anomaly_scores.size == 0:
+    raise ValueError("Input data 'sorted_patch_anomaly_scores' is empty or not a valid NumPy array. Please provide your data.")
+if sorted_patch_anomaly_scores.shape[0] != 256:
+    print(f"Warning: 'sorted_patch_anomaly_scores' has {sorted_patch_anomaly_scores.shape[0]} elements, not 256 as expected. Proceeding with available data.")
+
+print(f"Original data (first 10 elements): {sorted_patch_anomaly_scores[:10]}")
+print(f"Original data min: {np.min(sorted_patch_anomaly_scores):.4f}, max: {np.max(sorted_patch_anomaly_scores):.4f}")
+
+# --- Normalization to [0, 1] ---
+min_val = np.min(sorted_patch_anomaly_scores)
+max_val = np.max(sorted_patch_anomaly_scores)
+
+if max_val == min_val:
+    normalized_data = np.zeros_like(sorted_patch_anomaly_scores)
+    print("Warning: All data points are identical. Normalized data will be all zeros.")
+else:
+    normalized_data = (sorted_patch_anomaly_scores - min_val) / (max_val - min_val)
+
+print(f"\nNormalized data (first 10 elements): {normalized_data[:10]}")
+print(f"Normalized data min: {np.min(normalized_data):.4f}, max: {np.max(normalized_data):.4f}")
+
+# --- Create Output Directory ---
+plot_save_directory = "plots_metrics_analysis" # More generic name
+os.makedirs(plot_save_directory, exist_ok=True)
+print(f"\nOutput directory created/verified: '{plot_save_directory}'")
+
+# --- Plot Normalized Data (X vs Y) ---
+plt.figure(figsize=(10, 6))
+# X-axis will be the index (position), Y-axis will be the normalized value
+plt.plot(np.arange(len(normalized_data)), normalized_data, linestyle='-', marker='.', markersize=4, color='darkblue')
+plt.title('Normalized Anomaly Scores (Sorted)', fontsize=14)
+plt.xlabel('Index', fontsize=12)
+plt.ylabel('Normalized Score (0-1)', fontsize=12)
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.tight_layout()
+
+output_normalized_data_plot_filename = os.path.join(plot_save_directory, 'normalized_anomaly_scores_plot.png')
+plt.savefig(output_normalized_data_plot_filename)
+print(f"\nNormalized data plot saved to: '{output_normalized_data_plot_filename}'")
+plt.close()
+
+
+# --- Define Calculation Functions ---
+
+def calculate_rms(data):
+    """Calculates the Root Mean Square (RMS) of an array of data."""
+    return np.sqrt(np.mean(data**2))
+
+def calculate_mad(data):
+    """Calculates the Median Absolute Deviation (MAD) of an array of data."""
+    return median_abs_deviation(data)
+
+def calculate_median(data):
+    """Calculates the Median of an array of data."""
+    return np.median(data)
+
+def calculate_low_percentile(data, percentile=10):
+    """Calculates a low percentile (e.g., 10th percentile) to represent low values."""
+    return np.percentile(data, percentile)
+
+
+# --- Calculate Metrics from Normalized Data ---
+
+# Metric A: RMS (sensitive to high values)
+A_rms = calculate_rms(normalized_data)
+
+# Metric B: MAD (robust measure of dispersion)
+B_mad = calculate_mad(normalized_data)
+
+# Metric C: Mediana (robust measure of central tendency)
+C_median = calculate_median(normalized_data)
+
+# Metric D: Percentil Bajo (e.g., 10th percentile, to measure low values)
+D_low_percentile = calculate_low_percentile(normalized_data, percentile=10) # You can change this percentile
+
+
+print(f"\nCalculations on Normalized Data:")
+print(f"RMS (A) = {A_rms:.4f}")
+print(f"MAD (B) = {B_mad:.4f}")
+print(f"Mediana (C) = {C_median:.4f}")
+print(f"10th Percentile (D) = {D_low_percentile:.4f}")
+
+
+# --- Plotting All Metric Values for Comparison ---
+metrics_labels = ['RMS (A)', 'MAD (B)', 'Mediana (C)', '10th Percentile (D)']
+metrics_values = [A_rms, B_mad, C_median, D_low_percentile]
+
+plt.figure(figsize=(10, 6))
+bars = plt.bar(metrics_labels, metrics_values, color=['skyblue', 'lightcoral', 'lightgreen', 'gold'])
+plt.ylabel('Value', fontsize=12)
+plt.title('Comparison of Key Metrics on Normalized Data', fontsize=14)
+plt.xticks(fontsize=10)
+plt.yticks(fontsize=10)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Add numeric values on top of bars
+for bar in bars:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom' if yval >= 0 else 'top', fontsize=9)
+
+plt.tight_layout()
+
+output_plot_filename_all_metrics = os.path.join(plot_save_directory, 'all_normalized_metrics_comparison_v2.png')
+plt.savefig(output_plot_filename_all_metrics)
+print(f"\nPlot of all metrics saved to: '{output_plot_filename_all_metrics}'")
+plt.close()
+
+
+# --- Plotting Key Differences (Distances) ---
+# Now using the 10th percentile for the 'low values' metric
+distances_labels = ['(RMS - MAD)', '(RMS - Mediana)', '(Mediana - 10th Percentile)']
+distances_values = [A_rms - B_mad, A_rms - C_median, C_median - D_low_percentile] # Corrected for low value insight
+
+plt.figure(figsize=(10, 7))
+bars = plt.bar(distances_labels, distances_values, color=['purple', 'orange', 'cyan'])
+plt.ylabel('Difference Value', fontsize=12)
+plt.title('Key Differences (Distances) Between Metrics', fontsize=14)
+plt.xticks(fontsize=10)
+plt.yticks(fontsize=10)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.axhline(0, color='grey', linewidth=0.8, linestyle='--') # Line at zero for reference
+
+# Add numeric values on top of each bar
+for bar in bars:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom' if yval >= 0 else 'top', fontsize=9)
+
+plt.tight_layout()
+
+output_plot_filename_distances = os.path.join(plot_save_directory, 'key_metric_differences_v2.png')
+plt.savefig(output_plot_filename_distances)
+print(f"Plot of key metric differences saved to: '{output_plot_filename_distances}'")
+plt.close()
+
+print("\nScript finished.")
+
+
+exit()
+
+
+
+
+
+
+
+
+
+################# saber si existe o no anomalias con tecnicas DWT y codo en pendiente #################
 import numpy as np
 import pywt # Importar la librería PyWavelets
 import matplotlib.pyplot as plt
@@ -348,13 +502,35 @@ if len(scores_to_analyze_for_slope) > 1:
         initial_slope_points = min(5, len(slopes))
         max_initial_slope = np.mean(slopes[:initial_slope_points])
         
-        # AJUSTA ESTE MULTIPLICADOR CRÍTICO para scores NORMALIZADOS
-        slope_threshold_multiplier = 0.2
+        # --- AJUSTE CLAVE AQUÍ: Definir slope_threshold_multiplier condicionalmente ---
+        slope_threshold_multiplier = 0.2 # Valor predeterminado
+        
+        # Si la primera pendiente es extremadamente pequeña en relación con el promedio inicial,
+        # lo que sugiere una estabilización casi inmediata (length_steep_slope sería 1).
+
+        # Si la primera pendiente es muy pequeña en relación con el promedio inicial,
+        # lo que sugiere una estabilización casi inmediata (length_steep_slope sería 1).
+        if max_initial_slope > 1e-6: # Evitar división por cero
+            # Aumentamos el umbral para que la condición sea TRUE más fácilmente
+            # Por ejemplo, si slopes[0] es menor que el 10% del promedio inicial
+            if slopes[0] < (max_initial_slope * 0.10): # Ajustado de 0.01 a 0.10
+                slope_threshold_multiplier = 0.02 # O 0.001 si esa es tu intención final
+                print(f"  --> Ajustando slope_threshold_multiplier a {slope_threshold_multiplier:.2f} (caída inicial muy abrupta).")
+ 
+        
         slope_threshold = max_initial_slope * slope_threshold_multiplier
         
         print(f"\nCalculando codo por umbral de pendiente (en scores normalizados):")
         print(f"   Pendiente inicial promedio ({initial_slope_points} pts): {max_initial_slope:.6f}")
         print(f"   Umbral de pendiente para detección de codo: {slope_threshold:.6f}")
+        print(f"   Multiplicador de umbral de pendiente usado: {slope_threshold_multiplier:.2f}")
+
+        print(f"\nPrimeros 5 scores normalizados: {current_scores_for_analysis[:5]}")
+        if len(slopes) > 0:
+            print(f"Primeros 5 valores de pendientes (abs): {slopes[:5]}")
+            print(f"max_initial_slope: {max_initial_slope:.6f}")
+            print(f"slope_threshold actual: {slope_threshold:.6f}")
+        
 
         for i in range(len(slopes)):
             if slopes[i] < slope_threshold:
@@ -453,8 +629,10 @@ def classify_anomaly_type(results: dict):
 
     THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY = 10 
     
-    # *** NUEVO UMBRAL: Para una caída EXTREMADAMENTE rápida (prioridad para "Buena") ***
-    THRESHOLD_EXTREMELY_RAPID_FALL_GOOD = 2 # Valores de length_steep_slope como 1, 2, 3
+    # Este umbral no se usa directamente en la lógica de clasificación con el cambio actual,
+    # ya que la decisión de "caída extremadamente rápida" ahora se basa más en el THRESHOLD_SCORE_AT_ELBOW_GOOD
+    # y la lógica del codo.
+    # THRESHOLD_EXTREMELY_RAPID_FALL_GOOD = 2 
 
     # Los demás umbrales se mantienen como los indicados en tu último log o por defecto
     THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR = 0.25
@@ -515,29 +693,26 @@ def classify_anomaly_type(results: dict):
         if original_max_score < THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD: 
             print(f"  --> Dentro del sub-rango intermedio muy bajo (< {THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD:.2f}).")
             if is_elbow_score_below_threshold:
-                # Para estos scores, si el codo es bueno, es buena, incluso si la caída no es ultra-rápida.
                 return f"Buena (Pico muy bajo en rango intermedio, perfil {shape_type_adjective_profile} - codo temprano y score bajo)"
             else:
-                # Si incluso con un score tan bajo, el codo no es bueno, es una anomalía muy sutil.
                 return f"Límite: Falla muy pequeña (Pico muy bajo, perfil {shape_type_adjective_profile} - codo no tan bajo)"
         
         # Clasificación para el resto del rango intermedio (0.17 a 0.30)
         else: # original_max_score >= THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD
             print(f"  --> Dentro del sub-rango intermedio medio/alto (>= {THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD:.2f}).")
             
-            # *** NUEVA LÓGICA DE PRIORIDAD: Si la caída es EXTREMADAMENTE rápida ***
-            print(f"  --> Evaluación de prioridad: Caída extremadamente rápida (length_steep_slope <= {THRESHOLD_EXTREMELY_RAPID_FALL_GOOD}).")
-            if length_steep_slope < THRESHOLD_EXTREMELY_RAPID_FALL_GOOD:
-                # Si el pico cae casi inmediatamente, se considera Buena independientemente del score exacto en el codo.
-                return f"Buena (Pico en rango intermedio, caída EXTREMADAMENTE rápida y perfil {shape_type_adjective_profile})"
-            
-            # Lógica existente para caída rápida (pero no extremadamente) Y codo bajo
-            elif length_steep_slope <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY and is_elbow_score_below_threshold:
+            # La condición para "caída extremadamente rápida" ahora se gestiona por la precisión del codo y el umbral de score.
+            # Se ha eliminado el 'THRESHOLD_EXTREMELY_RAPID_FALL_GOOD' como una prioridad separada aquí
+            # para evitar contradicciones con el objetivo de clasificar el caso anterior como "Anomalía Leve".
+
+            # Lógica para caída rápida (pero no extremadamente) Y codo bajo
+            if length_steep_slope <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY and is_elbow_score_below_threshold:
                 if is_concentrated_shape:
                     return f"Buena (Pico en rango intermedio, caída muy rápida y concentrada - codo temprano y score bajo)"
                 else:
                     return f"Buena (Pico en rango intermedio, caída muy rápida, pero con perfil distribuido - codo temprano y score bajo)"
             else:
+                # Este caso incluye aquellos con caída rápida pero score en el codo no lo suficientemente bajo.
                 return f"Anomalía Leve (Pico en rango intermedio, caída {shape_type_adjective_profile} y sostenida)"
     
     # Fallback para cualquier caso no cubierto
@@ -636,7 +811,7 @@ plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
 plt.colorbar(label='Puntuación de Anomalía Normalizada')
 plt.axis('off')
 
-heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_cut_013.png')
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_hole_000.png')
 plt.tight_layout()
 plt.savefig(heatmap_output_filename)
 print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
@@ -753,7 +928,7 @@ if len(detected_strong_anomaly_regions) > 0:
     ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
     plt.legend()
 
-    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_cut_013.png')
+    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_hole_000.png')
     plt.tight_layout()
     plt.savefig(strong_regions_overlay_output_filename)
     plt.close()
