@@ -5,321 +5,124 @@ import os
 from PIL import Image
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
-from sklearn.metrics.pairwise import euclidean_distances
+# from sklearn.metrics.pairwise import euclidean_distances # Not directly used in final logic for distances
 import time
-#start_time = time.time() 
-# Importar las utilidades de FeatUp para normalización/desnormalización
-from featup.util import norm, unnorm
-from featup.plotting import plot_feats # Asegúrate de que esta importación sea correcta
 
+# Import FeatUp utilities for normalization/denormalization
+from featup.util import norm, unnorm
+# from featup.plotting import plot_feats # Not used in this specific plotting task
 
 from sklearn.neighbors import NearestNeighbors
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
-from scipy.cluster.hierarchy import dendrogram, linkage
-from scipy.spatial.distance import pdist
-#import seaborn as sns
-from sklearn.cluster import KMeans
-
-
-
-# --- Configuración Inicial ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_size = 224 # Tamaño de entrada para DINOv2
-BACKBONE_PATCH_SIZE = 14 # Tamaño de parche para DINOv2 ViT-S/14
-use_norm = True # Coherente con tu enfoque
-
-# Las dimensiones espaciales de los mapas de características de baja resolución (H', W')
-H_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
-W_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
-
-# Directorio de imágenes (ajusta según tu estructura)
-directorio_imagenes = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/train/good'
-
-# Rutas de archivo para cargar los mapas de características completos relevantes para el Coreset
-core_bank_features_file = os.path.join(directorio_imagenes, 'core_bank_features.pt') # no usado en este stage
-core_bank_filenames_file = os.path.join(directorio_imagenes, 'core_bank_filenames.pt')
-# --- NUEVO: Ruta para el banco de características del coreset relevante, ya aplanado y apilado ---
-coreset_relevant_flat_features_bank_file = os.path.join(directorio_imagenes, 'coreset_relevant_flat_features_bank.pt')
-
-# coreset_features_file from Stage 1 (THIS IS YOUR M)
-template_features_bank_coreset_file = os.path.join(directorio_imagenes, 'template_features_bank_coreset.pt')# para mapa de calor
-
-
-# --- Cargar los datos del coreset relevante ---
-print("Cargando datos del coreset relevante...")
-coreset_relevant_filenames = []
-coreset_relevant_flat_features_bank = None # Este será el tensor aplanado y apilado
-
-try:
-    coreset_relevant_filenames = torch.load(core_bank_filenames_file)
-    # Cargar el banco de características ya aplanado y apilado
-    coreset_relevant_flat_features_bank = torch.load(coreset_relevant_flat_features_bank_file).to(device)
-
-    print(f"Banco de características relevante (aplanado y apilado) cargado. Dimensión: {coreset_relevant_flat_features_bank.shape}")
-    print(f"Número de nombres de archivo relevantes cargados: {len(coreset_relevant_filenames)}")
-    if coreset_relevant_filenames:
-        print(f"Ejemplo de nombre de archivo relevante cargado: {coreset_relevant_filenames[0]}")
-
-except FileNotFoundError as e:
-    print(f"Error al cargar archivos del coreset relevante: {e}. Asegúrate de que Stage 1 se haya ejecutado correctamente y los archivos existan.")
-    exit() # Salir si los archivos esenciales no se encuentran
-except Exception as e:
-    print(f"Ocurrió un error al cargar o procesar los archivos del coreset relevante: {e}")
-    exit()
-
-# Define donde quieres guardar el plot
-plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_5'# Nueva carpeta para esta etapa
-output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_plot.png')
-os.makedirs(plot_save_directory_on_server, exist_ok=True)
-
-# --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/hole/000.png' ###########################
-query_img_pil = Image.open(query_image_path).convert('RGB')
-
-# Mostrar y guardar la imagen de consulta
-plt.imshow(query_img_pil)
-plt.title('Imagen de Consulta')
-plt.axis('off')
-plt.savefig(output_plot_filename)
-print(f"Plot de la imagen de consulta guardado en: {output_plot_filename}")
-plt.close() # Cerrar el plot para liberar memoria
-
-# --- Cargar modelo DINOv2 (a través de FeatUp) ---
-print("Cargando modelo DINOv2 para extracción de características de consulta...")
-upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=use_norm).to(device)
-dinov2_model = upsampler.model # Obtiene el modelo base DINOv2 del upsampler
-dinov2_model.eval() # Pone el modelo en modo de evaluación
-print("Modelo DINOv2 cargado.")
-
-# --- Transformación Única para todas las imágenes ---
-transform = T.Compose([
-    T.Resize(input_size),
-    T.CenterCrop((input_size, input_size)),
-    T.ToTensor(), # Escala píxeles a [0, 1] y cambia a (C, H, W)
-    norm # Aplica normalización por media/std (normalización ImageNet)
-])
-
-def extract_dinov2_features_lr(image_path, model, image_transform, device):
-    """Extrae características de baja resolución de DINOv2 usando la transformación dada."""
-    input_tensor = image_transform(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
-    print(f"Shape del tensor de entrada: {input_tensor.shape}")
-    with torch.no_grad():
-        features = model(input_tensor)
-    return features.cpu() # Mantener en CPU hasta que sea necesario
-
-# Extraer características de la imagen de consulta
-query_lr_features = extract_dinov2_features_lr(query_image_path, dinov2_model, transform, device)
-print(f"Dimensiones de características de consulta (baja resolución): {query_lr_features.shape}")
-
-#########################################
-##################################
-# Medir el tiempo de generación del mapa de calor
-start_time_heatmap = time.time()
-
-### AÑADIDO: Cálculo de distancias a nivel de parche y generación del mapa de calor ###
-
-# Aplanar las características de la imagen de consulta para obtener vectores de parches
-# query_lr_features tiene forma (1, C, H', W')
-query_patches_flat = query_lr_features.squeeze(0).permute(1, 2, 0).reshape(-1, query_lr_features.shape[1])
-# query_patches_flat ahora tiene forma (H'*W', C) => (256, 384) para DINOv2-S/14
-print(f"Dimensiones de parches de consulta aplanados: {query_patches_flat.shape}")
-
-### AÑADIDO: INICIO DEL BLOQUE DE CÁLCULO DE MAPA DE CALOR Y Q-SCORE ###
-start_time_coreset_load = time.time()
-
-# --- Cargar el banco de memoria del Coreset (el verdadero M) ---
-print("Cargando el banco de memoria (coreset_features)...")
-coreset_features = None # Este será el tensor (Num_Coreset_Patches, C)
-
-try:
-    # --- CARGA coreset_features ---
-    coreset_features = torch.load(template_features_bank_coreset_file).to(device) 
-    print(f"Coreset de características (M) cargado. Dimensión: {coreset_features.shape}") # esperado(H'*W', C) => (256, 384) => (16*16, 384) para DINOv2-S/14 y (224x224) HxW 
-
-except FileNotFoundError as e:
-    print(f"Error al cargar el coreset de características: {e}. Asegúrate de que Stage 1 se haya ejecutado correctamente y el archivo '{template_features_bank_coreset_file}' exista.")
-    exit() # Salir si el archivo esencial no se encuentra
-except Exception as e:
-    print(f"Ocurrió un error al cargar o procesar el coreset de características: {e}")
-    exit()
-
-end_time_coreset_load = time.time()
-print(f"Tiempo para cargar el coreset: {end_time_coreset_load - start_time_coreset_load:.4f} segundos")
-
-
-# Mover el coreset a CPU para sklearn, si no quieres usar Faiss/torch.cdist (más complejo)
-coreset_features_cpu = coreset_features.cpu().numpy()
-print(f"Forma del coreset de características en CPU: {coreset_features_cpu.shape}") # (H'*W', C) => (256, 384) para DINOv2-S/14
-query_patches_flat_cpu = query_patches_flat.cpu().numpy()
-print(f"Forma de los parches de consulta aplanados en CPU: {query_patches_flat_cpu.shape}") # (H'*W', C) => (256, 384) para DINOv2-S/14
-
-# 1. Calcular distancias de coseno entre cada parche de consulta y el coreset
-print("\nCalculando distancias de coseno a nivel de parche...")
-start_time_distances = time.time()
-
-# Usar NearestNeighbors para encontrar el vecino más cercano y su distancia
-from sklearn.neighbors import NearestNeighbors
-# n_neighbors=1 porque solo queremos la distancia al más cercano
-# metric='cosine' para distancia de coseno
-# algorithm='brute' es simple, para grandes coreset, 'kd_tree' o 'ball_tree' o Faiss son mejores           # el modelo conoce las características del coreset
-nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu) #instancia del model adapta neighbors model al conjunto de datos
-distances_to_nn, _ = nn_finder.kneighbors(query_patches_flat_cpu)  # = ()1 pxel tiene un parche y tiene un vector de C (C=384 para DINOv2-S/14)
-# distances_to_nn tendrá forma (H'*W', 1)
-patch_anomaly_scores = distances_to_nn.flatten() # Forma (H'*W',)
-# --- Aplicar Hierarchical Clustering a patch_anomaly_scores ---
-print("\nAplicando Hierarchical Clustering a patch_anomaly_scores...")
-
-# Calcular la matriz de distancias entre los scores
-distance_matrix = pdist(patch_anomaly_scores.reshape(-1, 1), metric='euclidean')
-
-# Generar el linkage matrix para el dendrograma
-linkage_matrix = linkage(distance_matrix, method='ward')
-
-# Visualizar el dendrograma
-plt.figure(figsize=(12, 6))
-dendrogram(linkage_matrix, color_threshold=0.5 * max(linkage_matrix[:, 2]), no_labels=True)
-plt.title("Dendrograma de Clustering Jerárquico (patch_anomaly_scores)")
-plt.xlabel("Índices de Parches")
-plt.ylabel("Distancia Euclidiana")
-
-# Guardar el dendrograma en un archivo
-output_dendrogram_filename = os.path.join(plot_save_directory_on_server, 'patch_anomaly_scores_dendrogram.png')
-plt.tight_layout()
-plt.savefig(output_dendrogram_filename)
-print(f"Dendrograma de clustering jerárquico guardado en: {output_dendrogram_filename}")
-plt.close()
-
-# --- Aplicar K-Means a patch_anomaly_scores ---
-
-# Número de clusters (puedes ajustar este valor según sea necesario)
-num_clusters = 3
-
-# Reshape patch_anomaly_scores para K-Means
-patch_anomaly_scores_reshaped = patch_anomaly_scores.reshape(-1, 1)
-
-# Aplicar K-Means
-kmeans = KMeans(n_clusters=num_clusters, random_state=42)
-kmeans_labels = kmeans.fit_predict(patch_anomaly_scores_reshaped)
-
-# Reshape las etiquetas de los clusters a la forma espacial (H', W')
-kmeans_labels_reshaped = kmeans_labels.reshape(H_prime, W_prime)
-
-# Visualizar los clusters en el mapa de anomalías
-plt.figure(figsize=(10, 8))
-plt.imshow(kmeans_labels_reshaped, cmap='tab10', interpolation='nearest')
-plt.title(f"K-Means Clustering (k={num_clusters}) en patch_anomaly_scores")
-plt.colorbar(label='Cluster ID')
-plt.axis('off')
-
-# Guardar el plot en un archivo
-output_kmeans_plot_filename = os.path.join(plot_save_directory_on_server, 'kmeans_patch_anomaly_scores.png')
-plt.tight_layout()
-plt.savefig(output_kmeans_plot_filename)
-print(f"Plot de K-Means en patch_anomaly_scores guardado en: {output_kmeans_plot_filename}")
-plt.close()
-
-
-
-
-
-end_time_distances = time.time()
-print(f"Tiempo para calcular distancias de parches: {end_time_distances - start_time_distances:.4f} segundos")
-print(f"Forma de las puntuaciones de anomalía de parches: {patch_anomaly_scores.shape}")
-# Imprimir los 5 primeros scores de anomalía de parches
-print("Primeros 5 scores de anomalía de parches:")
-print(patch_anomaly_scores[:5])
-
-
-# 2. Generar el mapa de calor (heatmap)
-# Reorganizar las puntuaciones de los parches a la forma espacial (H', W')
-anomaly_map_lr = patch_anomaly_scores.reshape(H_prime, W_prime)
-print(f"Forma del mapa de anomalías de baja resolución: {anomaly_map_lr.shape}")
-# Imprimir los 2 primeros valores del anomaly_map_lr
-print("Primeros 2 valores del anomaly_map_lr:")
-print(anomaly_map_lr.flatten()[:2])
-
-# Upsampling Bilineal a la resolución de entrada original
-# Convertir a tensor PyTorch, añadir dimensiones de batch y canal, y mover a device
-anomaly_map_lr_tensor = torch.from_numpy(anomaly_map_lr).unsqueeze(0).unsqueeze(0).to(device) # Forma (1, 1, H', W')
-anomaly_map_upsampled = F.interpolate(anomaly_map_lr_tensor, size=(input_size, input_size), mode='bilinear', align_corners=False)
-anomaly_map_upsampled = anomaly_map_upsampled.squeeze().cpu().numpy() # Quitar dimensiones de batch/canal, a numpy
-
-# Suavizado Gaussiano (opcional, pero recomendado por el paper)
-# sigma = 4.0 es el valor del paper
-anomaly_map_smoothed = gaussian_filter(anomaly_map_upsampled, sigma=4.0)
-
-# Normalizar el mapa de anomalías para visualización (opcional, pero útil)
-# Escalar a [0, 1] o [0, 255]
-anomaly_map_final = (anomaly_map_smoothed - anomaly_map_smoothed.min()) / (anomaly_map_smoothed.max() - anomaly_map_smoothed.min() + 1e-8)
-
-print(f"Forma del mapa de calor final: {anomaly_map_final.shape}")
-
-# 3. Calcular el q-score (puntuación a nivel de imagen)
-# Tomar el 1% de las puntuaciones de anomalía de parche más altas
-num_top_patches = int(len(patch_anomaly_scores) * 0.01)
-if num_top_patches == 0 and len(patch_anomaly_scores) > 0: # Asegurarse de tomar al menos 1 si hay menos de 100 parches
-    num_top_patches = 1
-
-top_anomaly_scores = np.sort(patch_anomaly_scores)[-num_top_patches:] # # Tomar el 1% superior
-
-# Imprimir los 5 primeros top scores
-print("Top scores de anomalía (1% superior):")
-print(top_anomaly_scores)
-# Ordenar los patch_anomaly_scores de forma descendente
-sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
-
+# from scipy.cluster.hierarchy import dendrogram, linkage # Not requested for batch plotting
+# from scipy.spatial.distance import pdist # Not requested for batch plotting
+# from sklearn.cluster import KMeans # Not requested for batch plotting
 
 from scipy.stats import median_abs_deviation
 
+# --- Configuration ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_size = 224 # Input size for DINOv2
+BACKBONE_PATCH_SIZE = 14 # Patch size for DINOv2 ViT-S/14
+use_norm = True # Consistent with your approach
 
+# Spatial dimensions of low-resolution feature maps (H', W')
+H_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
+W_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
 
+# Directories
+TRAIN_GOOD_DIR = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/train/good'
+TEST_CRACK_DIR = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/good' # Your target directory
+PLOT_SAVE_ROOT_DIR = '/home/imercatoma/FeatUp/plots_anomaly_distances' # New root for all distance plots
+os.makedirs(PLOT_SAVE_ROOT_DIR, exist_ok=True)
+print(f"Root plot save directory created/verified: '{PLOT_SAVE_ROOT_DIR}'")
 
-# Data validation
-if not isinstance(sorted_patch_anomaly_scores, np.ndarray) or sorted_patch_anomaly_scores.size == 0:
-    raise ValueError("Input data 'sorted_patch_anomaly_scores' is empty or not a valid NumPy array. Please provide your data.")
-if sorted_patch_anomaly_scores.shape[0] != 256:
-    print(f"Warning: 'sorted_patch_anomaly_scores' has {sorted_patch_anomaly_scores.shape[0]} elements, not 256 as expected. Proceeding with available data.")
+# Paths for Coreset files (from Stage 1/previous steps)
+core_bank_filenames_file = os.path.join(TRAIN_GOOD_DIR, 'core_bank_filenames.pt')
+coreset_relevant_flat_features_bank_file = os.path.join(TRAIN_GOOD_DIR, 'coreset_relevant_flat_features_bank.pt')
+template_features_bank_coreset_file = os.path.join(TRAIN_GOOD_DIR, 'template_features_bank_coreset.pt') # This is your M
 
-print(f"Original data (first 10 elements): {sorted_patch_anomaly_scores[:10]}")
-print(f"Original data min: {np.min(sorted_patch_anomaly_scores):.4f}, max: {np.max(sorted_patch_anomaly_scores):.4f}")
+# --- Load Coreset Data (The 'M' matrix for KNN) ---
+print("Loading relevant coreset data and feature bank (M)...")
+coreset_relevant_filenames = []
+coreset_relevant_flat_features_bank = None
+coreset_features = None # This will be the actual 'M' matrix for KNN
 
-# --- Normalization to [0, 1] ---
-min_val = np.min(sorted_patch_anomaly_scores)
-max_val = np.max(sorted_patch_anomaly_scores)
+try:
+    coreset_relevant_filenames = torch.load(core_bank_filenames_file)
+    coreset_relevant_flat_features_bank = torch.load(coreset_relevant_flat_features_bank_file).to(device)
+    coreset_features = torch.load(template_features_bank_coreset_file).to(device) # Your 'M'
+    
+    print(f"Coreset of features (M) loaded. Dimension: {coreset_features.shape}")
+    print(f"Coreset relevant flat features bank loaded. Dimension: {coreset_relevant_flat_features_bank.shape}")
+    print(f"Number of relevant filenames loaded: {len(coreset_relevant_filenames)}")
 
-if max_val == min_val:
-    normalized_data = np.zeros_like(sorted_patch_anomaly_scores)
-    print("Warning: All data points are identical. Normalized data will be all zeros.")
-else:
-    normalized_data = (sorted_patch_anomaly_scores - min_val) / (max_val - min_val)
+except FileNotFoundError as e:
+    print(f"Error loading coreset files: {e}. Ensure Stage 1 was executed and files exist.")
+    exit()
+except Exception as e:
+    print(f"An error occurred loading or processing coreset files: {e}")
+    exit()
 
-print(f"\nNormalized data (first 10 elements): {normalized_data[:10]}")
-print(f"Normalized data min: {np.min(normalized_data):.4f}, max: {np.max(normalized_data):.4f}")
+# Move coreset to CPU for sklearn's NearestNeighbors
+coreset_features_cpu = coreset_features.cpu().numpy()
+print(f"Coreset features moved to CPU. Shape: {coreset_features_cpu.shape}")
 
-# --- Create Output Directory ---
-plot_save_directory = "plots_metrics_analysis" # More generic name
-os.makedirs(plot_save_directory, exist_ok=True)
-print(f"\nOutput directory created/verified: '{plot_save_directory}'")
+# Initialize NearestNeighbors finder once
+nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu)
+print("NearestNeighbors finder initialized with coreset features.")
 
-# --- Plot Normalized Data (X vs Y) ---
-plt.figure(figsize=(10, 6))
-# X-axis will be the index (position), Y-axis will be the normalized value
-plt.plot(np.arange(len(normalized_data)), normalized_data, linestyle='-', marker='.', markersize=4, color='darkblue')
-plt.title('Normalized Anomaly Scores (Sorted)', fontsize=14)
-plt.xlabel('Index', fontsize=12)
-plt.ylabel('Normalized Score (0-1)', fontsize=12)
-plt.grid(True, linestyle='--', alpha=0.7)
-plt.tight_layout()
+# --- Load DINOv2 Model ---
+print("Loading DINOv2 model for feature extraction...")
+upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=use_norm).to(device)
+dinov2_model = upsampler.model # Get the base DINOv2 model from the upsampler
+dinov2_model.eval() # Set model to evaluation mode
+print("DINOv2 model loaded.")
 
-output_normalized_data_plot_filename = os.path.join(plot_save_directory, 'normalized_anomaly_scores_plot.png')
-plt.savefig(output_normalized_data_plot_filename)
-print(f"\nNormalized data plot saved to: '{output_normalized_data_plot_filename}'")
-plt.close()
+# --- Image Transformation ---
+transform = T.Compose([
+    T.Resize(input_size),
+    T.CenterCrop((input_size, input_size)),
+    T.ToTensor(), # Scales pixels to [0, 1] and changes to (C, H, W)
+    norm # Applies ImageNet normalization (mean/std)
+])
 
+# --- Core Function to Get Anomaly Scores for an Image ---
+def get_anomaly_scores_for_image(image_path, model, image_transform, nn_finder_instance, H_prime, W_prime, device):
+    """
+    Extracts DINOv2 features for a single image, computes patch anomaly scores
+    based on distance to coreset.
+    Returns sorted_patch_anomaly_scores.
+    """
+    # 1. Extract DINOv2 features for the query image
+    try:
+        input_tensor = image_transform(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
+    except Exception as e:
+        print(f"  Error loading/transforming image {os.path.basename(image_path)}: {e}")
+        return None
 
-# --- Define Calculation Functions ---
+    with torch.no_grad():
+        features_lr = model(input_tensor) # (1, C, H', W')
 
+    # 2. Flatten patches
+    query_patches_flat = features_lr.squeeze(0).permute(1, 2, 0).reshape(-1, features_lr.shape[1])
+    query_patches_flat_cpu = query_patches_flat.cpu().numpy()
+
+    # 3. Calculate distances to nearest neighbors in coreset
+    distances_to_nn, _ = nn_finder_instance.kneighbors(query_patches_flat_cpu)
+    patch_anomaly_scores = distances_to_nn.flatten() # (H'*W',)
+
+    # 4. Sort anomaly scores in descending order
+    sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
+
+    # Ensure it's 256 elements for consistency, though not strictly enforced in your previous code
+    # if sorted_patch_anomaly_scores.shape[0] != 256:
+    #     print(f"  Warning: Anomaly scores count is {sorted_patch_anomaly_scores.shape[0]}, not 256.")
+
+    return sorted_patch_anomaly_scores
+
+# --- Metric Calculation Functions (from previous steps) ---
 def calculate_rms(data):
     """Calculates the Root Mean Square (RMS) of an array of data."""
     return np.sqrt(np.mean(data**2))
@@ -332,85 +135,141 @@ def calculate_median(data):
     """Calculates the Median of an array of data."""
     return np.median(data)
 
-def calculate_low_percentile(data, percentile=10):
-    """Calculates a low percentile (e.g., 10th percentile) to represent low values."""
-    return np.percentile(data, percentile)
+def calculate_quartile(data, q=25):
+    """Calculates a specific quartile (e.g., 25th percentile for Q1)."""
+    return np.percentile(data, q)
 
 
-# --- Calculate Metrics from Normalized Data ---
+# --- BATCH PROCESSING AND DATA COLLECTION ---
+image_names_processed = []
+rms_mad_distances = []
+rms_median_distances = []
+rms_q1_distances = []
 
-# Metric A: RMS (sensitive to high values)
-A_rms = calculate_rms(normalized_data)
+print(f"\nStarting batch processing of images from: {TEST_CRACK_DIR}")
+try:
+    test_image_files = [f for f in os.listdir(TEST_CRACK_DIR) if f.lower().endswith('.png')]
+    test_image_files.sort() # Ensure consistent order
+    if not test_image_files:
+        print(f"No .png images found in: {TEST_CRACK_DIR}")
+except FileNotFoundError:
+    print(f"Error: Directory '{TEST_CRACK_DIR}' not found.")
+    test_image_files = []
 
-# Metric B: MAD (robust measure of dispersion)
-B_mad = calculate_mad(normalized_data)
+for img_file in test_image_files:
+    full_image_path = os.path.join(TEST_CRACK_DIR, img_file)
+    print(f"Processing image: {img_file}")
 
-# Metric C: Mediana (robust measure of central tendency)
-C_median = calculate_median(normalized_data)
+    # Get sorted anomaly scores for the current image
+    current_sorted_patch_anomaly_scores = get_anomaly_scores_for_image(
+        full_image_path, dinov2_model, transform, nn_finder, H_prime, W_prime, device
+    )
 
-# Metric D: Percentil Bajo (e.g., 10th percentile, to measure low values)
-D_low_percentile = calculate_low_percentile(normalized_data, percentile=10) # You can change this percentile
+    if current_sorted_patch_anomaly_scores is None:
+        print(f"  Skipping {img_file} due to processing error.")
+        continue # Skip to next image if error occurred
+
+    # --- Normalize Anomaly Scores ---
+    min_val = np.min(current_sorted_patch_anomaly_scores)
+    max_val = np.max(current_sorted_patch_anomaly_scores)
+
+    if max_val == min_val:
+        normalized_data = np.zeros_like(current_sorted_patch_anomaly_scores, dtype=float)
+        # print("  Warning: All anomaly scores are identical for this image. Normalized data will be all zeros.")
+    else:
+        normalized_data = (current_sorted_patch_anomaly_scores - min_val) / (max_val - min_val)
+
+    # --- Calculate Metrics from Normalized Data ---
+    A_rms = calculate_rms(normalized_data)
+    B_mad = calculate_mad(normalized_data)
+    C_median = calculate_median(normalized_data)
+    D_q1 = calculate_quartile(normalized_data, q=25) # 1st Quartile
+
+    # --- Calculate Distances ---
+    dist_rms_mad = A_rms - B_mad
+    dist_rms_median = A_rms - C_median
+    dist_rms_q1 = A_rms - D_q1
+
+    # Store results
+    image_names_processed.append(img_file)
+    rms_mad_distances.append(dist_rms_mad)
+    rms_median_distances.append(dist_rms_median)
+    rms_q1_distances.append(dist_rms_q1)
+
+    print(f"  Distances calculated for {img_file}:")
+    print(f"    (RMS - MAD): {dist_rms_mad:.4f}")
+    print(f"    (RMS - Mediana): {dist_rms_median:.4f}")
+    print(f"    (RMS - 1er Cuartil): {dist_rms_q1:.4f}")
 
 
-print(f"\nCalculations on Normalized Data:")
-print(f"RMS (A) = {A_rms:.4f}")
-print(f"MAD (B) = {B_mad:.4f}")
-print(f"Mediana (C) = {C_median:.4f}")
-print(f"10th Percentile (D) = {D_low_percentile:.4f}")
+# --- Plotting Results ---
+
+if not image_names_processed:
+    print("\nNo image data was successfully processed for plotting.")
+else:
+    # Determine figure width dynamically based on number of images
+    num_images = len(image_names_processed)
+    fig_width = max(12, num_images * 0.8) # Ensure reasonable minimum width, scale for more images
+    x_positions = np.arange(num_images)
+
+    # --- Plot 1: RMS - MAD Distances ---
+    plt.figure(figsize=(fig_width, 7))
+    bars = plt.bar(x_positions, rms_mad_distances, color='purple', width=0.6)
+    plt.ylabel('Distance (RMS - MAD)', fontsize=12)
+    plt.title('RMS - MAD Distance per Image (Test: hazelnut/crack)', fontsize=14)
+    plt.xticks(x_positions, image_names_processed, rotation=60, ha='right', fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.axhline(0, color='grey', linewidth=0.8, linestyle='--')
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.4f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
+    plt.tight_layout()
+    output_path_rms_mad = os.path.join(PLOT_SAVE_ROOT_DIR, 'distances_rms_mad_per_test_image.png')
+    plt.savefig(output_path_rms_mad)
+    print(f"\nPlot 'RMS - MAD per Image' saved to: '{output_path_rms_mad}'")
+    plt.close()
+
+    # --- Plot 2: RMS - Mediana Distances ---
+    plt.figure(figsize=(fig_width, 7))
+    bars = plt.bar(x_positions, rms_median_distances, color='orange', width=0.6)
+    plt.ylabel('Distance (RMS - Mediana)', fontsize=12)
+    plt.title('RMS - Mediana Distance per Image (Test: hazelnut/crack)', fontsize=14)
+    plt.xticks(x_positions, image_names_processed, rotation=60, ha='right', fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.axhline(0, color='grey', linewidth=0.8, linestyle='--')
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.4f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
+    plt.tight_layout()
+    output_path_rms_median = os.path.join(PLOT_SAVE_ROOT_DIR, 'distances_rms_median_per_test_image.png')
+    plt.savefig(output_path_rms_median)
+    print(f"Plot 'RMS - Mediana per Image' saved to: '{output_path_rms_median}'")
+    plt.close()
+
+    # --- Plot 3: RMS - 1st Quartile (Q1) Distances ---
+    plt.figure(figsize=(fig_width, 7))
+    bars = plt.bar(x_positions, rms_q1_distances, color='cyan', width=0.6)
+    plt.ylabel('Distance (RMS - 1er Cuartil)', fontsize=12)
+    plt.title('RMS - 1er Cuartil Distance per Image (Test: hazelnut/crack)', fontsize=14)
+    plt.xticks(x_positions, image_names_processed, rotation=60, ha='right', fontsize=10)
+    plt.yticks(fontsize=10)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.axhline(0, color='grey', linewidth=0.8, linestyle='--')
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.4f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
+    plt.tight_layout()
+    output_path_rms_q1 = os.path.join(PLOT_SAVE_ROOT_DIR, 'distances_rms_q1_per_test_image.png')
+    plt.savefig(output_path_rms_q1)
+    print(f"Plot 'RMS - 1er Cuartil per Image' saved to: '{output_path_rms_q1}'")
+    plt.close()
+
+print("\nBatch anomaly detection and metric analysis complete.")
 
 
-# --- Plotting All Metric Values for Comparison ---
-metrics_labels = ['RMS (A)', 'MAD (B)', 'Mediana (C)', '10th Percentile (D)']
-metrics_values = [A_rms, B_mad, C_median, D_low_percentile]
 
-plt.figure(figsize=(10, 6))
-bars = plt.bar(metrics_labels, metrics_values, color=['skyblue', 'lightcoral', 'lightgreen', 'gold'])
-plt.ylabel('Value', fontsize=12)
-plt.title('Comparison of Key Metrics on Normalized Data', fontsize=14)
-plt.xticks(fontsize=10)
-plt.yticks(fontsize=10)
-plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-# Add numeric values on top of bars
-for bar in bars:
-    yval = bar.get_height()
-    plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom' if yval >= 0 else 'top', fontsize=9)
-
-plt.tight_layout()
-
-output_plot_filename_all_metrics = os.path.join(plot_save_directory, 'all_normalized_metrics_comparison_v2.png')
-plt.savefig(output_plot_filename_all_metrics)
-print(f"\nPlot of all metrics saved to: '{output_plot_filename_all_metrics}'")
-plt.close()
-
-
-# --- Plotting Key Differences (Distances) ---
-# Now using the 10th percentile for the 'low values' metric
-distances_labels = ['(RMS - MAD)', '(RMS - Mediana)', '(Mediana - 10th Percentile)']
-distances_values = [A_rms - B_mad, A_rms - C_median, C_median - D_low_percentile] # Corrected for low value insight
-
-plt.figure(figsize=(10, 7))
-bars = plt.bar(distances_labels, distances_values, color=['purple', 'orange', 'cyan'])
-plt.ylabel('Difference Value', fontsize=12)
-plt.title('Key Differences (Distances) Between Metrics', fontsize=14)
-plt.xticks(fontsize=10)
-plt.yticks(fontsize=10)
-plt.grid(axis='y', linestyle='--', alpha=0.7)
-plt.axhline(0, color='grey', linewidth=0.8, linestyle='--') # Line at zero for reference
-
-# Add numeric values on top of each bar
-for bar in bars:
-    yval = bar.get_height()
-    plt.text(bar.get_x() + bar.get_width()/2, yval, round(yval, 4), ha='center', va='bottom' if yval >= 0 else 'top', fontsize=9)
-
-plt.tight_layout()
-
-output_plot_filename_distances = os.path.join(plot_save_directory, 'key_metric_differences_v2.png')
-plt.savefig(output_plot_filename_distances)
-print(f"Plot of key metric differences saved to: '{output_plot_filename_distances}'")
-plt.close()
-
-print("\nScript finished.")
 
 
 exit()
