@@ -74,7 +74,7 @@ output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_
 os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
 # --- Extraer características de la imagen de consulta y buscar similares ---
-query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/cut/010.png' ###########################
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/cut/013.png' ###########################
 query_img_pil = Image.open(query_image_path).convert('RGB')
 
 # Mostrar y guardar la imagen de consulta
@@ -278,86 +278,283 @@ from kneed import KneeLocator # Importar KneeLocator
 # Simulación de plot_save_directory_on_server
 # Reemplaza con tu ruta real donde quieras guardar las imágenes
 #plot_save_directory_on_server = 'plots_wavelet'
-os.makedirs(plot_save_directory_on_server, exist_ok=True)
+
+
+
+
+print("Top scores de anomalía (1% superior):")
+print(top_anomaly_scores)
+# Ordenar los patch_anomaly_scores de forma descendente
+sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
 
 print("Top scores de anomalía (primeros 12, para referencia):")
 print(sorted_patch_anomaly_scores[:12])
 print(f"Total de scores: {len(sorted_patch_anomaly_scores)}")
 
+# --- Preservar el score máximo original antes de normalizar ---
+original_max_score = sorted_patch_anomaly_scores[0]
+print(f"\nScore máximo original (sin normalizar): {original_max_score:.6f}")
+
+
+# --- ESTRATEGIA A: NORMALIZACIÓN DE LOS SCORES ---
+# Normalizar los scores al rango [0, 1]
+if sorted_patch_anomaly_scores.max() > sorted_patch_anomaly_scores.min():
+    normalized_scores = (sorted_patch_anomaly_scores - sorted_patch_anomaly_scores.min()) / \
+                        (sorted_patch_anomaly_scores.max() - sorted_patch_anomaly_scores.min())
+    print("Scores de anomalía normalizados al rango [0, 1].")
+else:
+    normalized_scores = np.zeros_like(sorted_patch_anomaly_scores)
+    print("Todos los scores de anomalía son iguales, normalizados a cero.")
+
+# A partir de aquí, usa normalized_scores para todos los cálculos
+current_scores_for_analysis = normalized_scores
 
 # --- Aplicar la Transformada Wavelet Discreta (DWT) ---
-# Elegir una wavelet (ej., 'db4' - Daubechies 4, buena para detección de bordes)
-# Nivel de descomposición (cuántas veces se aplica la transformada)
-# Un nivel bajo (ej., 1 o 2) es bueno para capturar cambios bruscos.
 wavelet = 'db4'
-level = 1 # O 2, dependiendo de la granularidad que busques para el cambio brusco
+level = 1
+coeffs = pywt.wavedec(current_scores_for_analysis, wavelet, level=level)
 
-# Realizar la descomposición DWT
-# cA: Coeficientes de aproximación (componentes de baja frecuencia, suavizadas)
-# cD: Coeficientes de detalle (componentes de alta frecuencia, capturan los cambios/singularidades)
-coeffs = pywt.wavedec(sorted_patch_anomaly_scores, wavelet, level=level)
-
-# Extraer los coeficientes de detalle del nivel más fino (cD1)
-# Si level=1, coeffs[1] es cD1
-# Si level=2, coeffs[1] es cD2 (el más fino), coeffs[2] es cD1.
-# Queremos el detalle más fino para cambios bruscos, que está en coeffs[1] si level=1,
-# o coeffs[-level] si usas wavedec y quieres el detalle más alto.
 if level == 1:
     cD1 = coeffs[1]
 else:
-    # Si level > 1, el coeficiente de detalle más fino es el último en la lista (cD1)
     cD1 = coeffs[-1]
-
 
 print(f"\nNúmero de coeficientes de detalle (cD1): {len(cD1)}")
 print(f"Los 10 primeros coeficientes de detalle (cD1): {cD1[:10]}")
 
+# --- Calcular métricas de los coeficientes de detalle ---
+N_coeffs_to_consider = min(len(cD1), 20) # Considerar los primeros 20 coefs o menos si cD1 es más corto
+abs_sum_cD1 = np.sum(np.abs(cD1[:N_coeffs_to_consider]))
+energy_cD1 = np.sum(cD1[:N_coeffs_to_consider]**2)
+max_abs_cD1 = np.max(np.abs(cD1[:N_coeffs_to_consider]))
 
-# --- Visualizar los Coeficientes de Detalle (cD1) ---
+print(f"\nCaracterísticas de cD1 (primeros {N_coeffs_to_consider} coeficientes) de scores normalizados:")
+print(f"   Suma Absoluta (abs_sum_cD1): {abs_sum_cD1:.6f}")
+print(f"   Energía (energy_cD1): {energy_cD1:.6f}")
+print(f"   Máximo Absoluto (max_abs_cD1): {max_abs_cD1:.6f}")
+
+# --- Detección de "Codo" basada en cambio de pendiente ---
+elbow_point_index = None
+length_steep_slope = 0
+
+search_range = min(len(current_scores_for_analysis), 100) # Buscar el codo en los primeros 100 puntos
+scores_to_analyze_for_slope = current_scores_for_analysis[:search_range]
+x_indices = np.arange(search_range)
+
+if len(scores_to_analyze_for_slope) > 1:
+    slopes = np.abs(np.diff(scores_to_analyze_for_slope))
+
+    if len(slopes) > 0:
+        initial_slope_points = min(5, len(slopes))
+        max_initial_slope = np.mean(slopes[:initial_slope_points])
+        
+        # AJUSTA ESTE MULTIPLICADOR CRÍTICO para scores NORMALIZADOS
+        slope_threshold_multiplier = 0.2
+        slope_threshold = max_initial_slope * slope_threshold_multiplier
+        
+        print(f"\nCalculando codo por umbral de pendiente (en scores normalizados):")
+        print(f"   Pendiente inicial promedio ({initial_slope_points} pts): {max_initial_slope:.6f}")
+        print(f"   Umbral de pendiente para detección de codo: {slope_threshold:.6f}")
+
+        for i in range(len(slopes)):
+            if slopes[i] < slope_threshold:
+                elbow_point_index = i + 1
+                break
+    
+    if elbow_point_index is not None:
+        length_steep_slope = elbow_point_index
+        print(f"Codo detectado (Umbral de Pendiente): {elbow_point_index}, Longitud: {length_steep_slope}")
+    else:
+        length_steep_slope = len(scores_to_analyze_for_slope) 
+        print(f"No se detectó un punto de 'codo' claro con el umbral de pendiente.")
+        print(f"Longitud estimada de la pendiente inclinada (asumiendo toda la porción analizada): {length_steep_slope} puntos")
+else:
+    length_steep_slope = 0
+    print("\nNo hay suficientes scores para calcular la pendiente para la detección de codo.")
+
+if elbow_point_index is None and len(scores_to_analyze_for_slope) <= 1:
+    elbow_point_index = None
+    length_steep_slope = 0
+
+# --- Calcular el score original en la ubicación del codo ---
+score_at_elbow_original = None
+if elbow_point_index is not None and elbow_point_index < len(sorted_patch_anomaly_scores):
+    score_at_elbow_original = sorted_patch_anomaly_scores[elbow_point_index]
+    print(f"Score en el punto del codo (Original): {score_at_elbow_original:.6f}")
+else:
+    score_at_elbow_original = float('inf') 
+
+# --- Visualizar los Coeficientes de Detalle (cD1) y el Codo ---
 plt.figure(figsize=(14, 7))
 
-# Plotear los scores originales
-plt.subplot(2, 1, 1) # 2 filas, 1 columna, primer plot
-plt.plot(sorted_patch_anomaly_scores, label='Scores de Anomalía Ordenados', color='blue')
-plt.title("Scores de Anomalía Ordenados (Mayor a Menor)")
+plt.subplot(2, 1, 1)
+plt.plot(current_scores_for_analysis, label='Scores de Anomalía Ordenados (Normalizados)', color='blue')
+if elbow_point_index is not None and elbow_point_index < len(current_scores_for_analysis):
+    plt.axvline(x=elbow_point_index, color='green', linestyle='--', label=f'Codo detectado (índice: {elbow_point_index})')
+    plt.plot(elbow_point_index, current_scores_for_analysis[elbow_point_index], 'go', markersize=8)
+plt.title("Scores de Anomalía Ordenados (Normalizados) con Codo Detectado")
 plt.xlabel("Índice")
-plt.ylabel("Score")
+plt.ylabel("Score Normalizado")
 plt.grid(True)
 plt.legend()
 
-# Plotear los coeficientes de detalle (cD1)
-plt.subplot(2, 1, 2) # Segundo plot
-# Los coeficientes de detalle tienen una longitud diferente a la señal original.
-# Mapeamos sus índices a la señal original para la visualización.
-# La longitud de cD1 es aproximadamente la mitad de la longitud de la señal original.
-x_axis_cD1 = np.linspace(0, len(sorted_patch_anomaly_scores) - 1, len(cD1))
+plt.subplot(2, 1, 2)
+x_axis_cD1 = np.linspace(0, len(current_scores_for_analysis) - 1, len(cD1))
 plt.plot(x_axis_cD1, cD1, label=f'Coeficientes de Detalle (cD1, Wavelet: {wavelet})', color='red')
+plt.axhline(y=0.01, color='purple', linestyle=':', label='Mini-umbral 0.01 (referencia para cD1)')
+plt.axhline(y=-0.01, color='purple', linestyle=':') 
 plt.title(f"Coeficientes de Detalle (cD1) de la Transformada Wavelet Discreta")
 plt.xlabel("Posición aproximada en la secuencia original")
 plt.ylabel("Amplitud del Coeficiente de Detalle")
 plt.grid(True)
 plt.legend()
 
-plt.tight_layout() # Ajustar el layout para evitar solapamientos
+plt.tight_layout()
 
-# Guardar el plot
-output_dwt_coeffs_plot_filename = os.path.join(plot_save_directory_on_server, 'dwt_detail_coefficients.png')
+output_dwt_coeffs_plot_filename = os.path.join(plot_save_directory_on_server, 'dwt_detail_coefficients_normalized_with_elbow.png')
 plt.savefig(output_dwt_coeffs_plot_filename)
-print(f"\nPlot de los coeficientes de detalle DWT guardado en: {output_dwt_coeffs_plot_filename}")
+print(f"\nPlot de los coeficientes de detalle DWT y codo guardado en: {output_dwt_coeffs_plot_filename}")
 plt.close()
 
-# --- Interpretación Potencial ---
-# Valores absolutos altos en cD1 indican cambios bruscos.
-# La posición de estos picos en cD1 corresponde a la posición del cambio en la señal original.
-# Para distinguir tus casos:
-# - 'Buena' (1/x): Se esperaría un pico de cD1 al principio, que decae rápidamente.
-# - 'Anomalía pequeña/grande' (lineal): Se esperaría un pico de cD1 al principio, pero quizás más sostenido o con una forma diferente.
-# Puedes analizar el valor máximo de cD1 y su decaimiento.
-# Por ejemplo, si los primeros coeficientes de detalle son muy altos, y luego bajan bruscamente,
-# podría indicar esa transición de "pendiente inclinada" a "suave".
-# La "longitud" de la sección empinada se reflejaría en cuántos de los primeros coeficientes de detalle
-# son significativamente grandes.
+# --- Consolidar resultados para clasificación ---
+analysis_results = {
+    'original_max_score': original_max_score, 
+    'max_score': current_scores_for_analysis[0],
+    'abs_sum_cD1': abs_sum_cD1,
+    'energy_cD1': energy_cD1,
+    'max_abs_cD1': max_abs_cD1,
+    'elbow_point_index': elbow_point_index,
+    'length_steep_slope': length_steep_slope,
+    'score_at_elbow_original': score_at_elbow_original,
+}
+
+print("\n--- Resultados del Análisis (incluye Original Max Score) ---")
+for key, value in analysis_results.items():
+    if isinstance(value, float):
+        print(f"{key}: {value:.6f}")
+    else:
+        print(f"{key}: {value}")
+
+
+# --- Lógica de Clasificación con la nueva estrategia ---
+
+def classify_anomaly_type(results: dict):
+    original_max_score = results['original_max_score']
+    abs_sum_cD1 = results['abs_sum_cD1']
+    length_steep_slope = results['length_steep_slope']
+    max_abs_cD1 = results['max_abs_cD1']
+    score_at_elbow_original = results['score_at_elbow_original']
+
+    # --- UMBRALES CLAVE DE CLASIFICACIÓN (AJUSTAR CUIDADOSAMENTE) ---
+    THRESHOLD_ORIGINAL_MAX_LARGE = 0.30
+    THRESHOLD_ORIGINAL_MAX_MILD_MIN = 0.15 
+    
+    THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD = 0.17 
+
+    THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY = 10 
+    
+    # *** NUEVO UMBRAL: Para una caída EXTREMADAMENTE rápida (prioridad para "Buena") ***
+    THRESHOLD_EXTREMELY_RAPID_FALL_GOOD = 2 # Valores de length_steep_slope como 1, 2, 3
+
+    # Los demás umbrales se mantienen como los indicados en tu último log o por defecto
+    THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR = 0.25
+    THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR = 0.60 
+    THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD = 0.08 
+    
+    # Ajustado de 0.30 a 0.20
+    THRESHOLD_SCORE_AT_ELBOW_GOOD = 0.20 
+    
+    # Inicializar is_elbow_score_below_threshold antes de usarla
+    is_elbow_score_below_threshold = False 
+    if score_at_elbow_original is not None and score_at_elbow_original != float('inf'):
+        is_elbow_score_below_threshold = (score_at_elbow_original < THRESHOLD_SCORE_AT_ELBOW_GOOD)
+
+
+    # Calcular la nueva métrica de "concentración de cambio"
+    concentration_of_change = max_abs_cD1 / abs_sum_cD1 if abs_sum_cD1 != 0 else 0
+
+    print(f"\n--- Clasificando ---")
+    print(f"  Original Max Score: {original_max_score:.6f}")
+    print(f"  Suma Abs cD1 (Normalizado): {abs_sum_cD1:.6f}")
+    print(f"  Máx Abs cD1 (Normalizado): {max_abs_cD1:.6f}")
+    print(f"  Concentración de Cambio (MaxAbsCD1/AbsSumCD1): {concentration_of_change:.6f}")
+    print(f"  Longitud Pendiente (Ubicación del Codo): {length_steep_slope}")
+    print(f"  Score en el Codo (Original): {score_at_elbow_original:.6f}") 
+
+    # --- Generar el descriptor de forma (para integrar directamente en la frase) ---
+    is_concentrated_shape = concentration_of_change > THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR
+    shape_type_adjective_profile = "concentrado" if is_concentrated_shape else "distribuido"
+
+
+    # --- LÓGICA DE CLASIFICACIÓN ---
+    print("\n--- Evaluación de Condiciones ---")
+    print(f"original_max_score ({original_max_score:.6f}) > THRESHOLD_ORIGINAL_MAX_LARGE ({THRESHOLD_ORIGINAL_MAX_LARGE:.2f}): {original_max_score > THRESHOLD_ORIGINAL_MAX_LARGE}")
+    print(f"original_max_score ({original_max_score:.6f}) < THRESHOLD_ORIGINAL_MAX_MILD_MIN ({THRESHOLD_ORIGINAL_MAX_MILD_MIN:.2f}): {original_max_score < THRESHOLD_ORIGINAL_MAX_MILD_MIN}")
+    print(f"length_steep_slope ({length_steep_slope}) <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY ({THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY}): {length_steep_slope <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY}")
+    print(f"is_elbow_score_below_threshold ({score_at_elbow_original:.6f} < {THRESHOLD_SCORE_AT_ELBOW_GOOD:.2f}): {is_elbow_score_below_threshold}")
+    print(f"abs_sum_cD1 ({abs_sum_cD1:.6f}) < THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD ({THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD:.2f}): {abs_sum_cD1 < THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD}")
+    print(f"concentration_of_change ({concentration_of_change:.6f}) > THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR ({THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR:.2f}): {concentration_of_change > THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR}")
+    print(f"concentration_of_change ({concentration_of_change:.6f}) > THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR ({THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR:.2f}): {concentration_of_change > THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR}")
+
+
+    # 1. Anomalía GRANDE (Score de pico original muy alto)
+    if original_max_score > THRESHOLD_ORIGINAL_MAX_LARGE:
+        print("Entra en: Anomalía Grande (Pico muy alto)")
+        return f"Anomalía Grande (Pico muy alto, perfil {shape_type_adjective_profile})"
+
+    # 2. IMAGEN BUENA (Score de pico original BAJO - ¡Se da por sentado!)
+    elif original_max_score < THRESHOLD_ORIGINAL_MAX_MILD_MIN: 
+        print("  --> Entra en la condición de 'Buena' por score original BAJO (incondicional).")
+        return f"Buena (Score pico muy bajo, perfil {shape_type_adjective_profile} y baja actividad general)"
+            
+    # 3. RANGO INTERMEDIO (0.15 a 0.30) - Aquí se subdivide
+    elif original_max_score >= THRESHOLD_ORIGINAL_MAX_MILD_MIN and original_max_score <= THRESHOLD_ORIGINAL_MAX_LARGE:
+        print("  --> Dentro del rango de scores originales intermedios (0.15-0.30).")
+
+        # Sub-clasificación para scores MUY BAJOS dentro del rango intermedio (0.15 a < 0.17)
+        if original_max_score < THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD: 
+            print(f"  --> Dentro del sub-rango intermedio muy bajo (< {THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD:.2f}).")
+            if is_elbow_score_below_threshold:
+                # Para estos scores, si el codo es bueno, es buena, incluso si la caída no es ultra-rápida.
+                return f"Buena (Pico muy bajo en rango intermedio, perfil {shape_type_adjective_profile} - codo temprano y score bajo)"
+            else:
+                # Si incluso con un score tan bajo, el codo no es bueno, es una anomalía muy sutil.
+                return f"Límite: Falla muy pequeña (Pico muy bajo, perfil {shape_type_adjective_profile} - codo no tan bajo)"
+        
+        # Clasificación para el resto del rango intermedio (0.17 a 0.30)
+        else: # original_max_score >= THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD
+            print(f"  --> Dentro del sub-rango intermedio medio/alto (>= {THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD:.2f}).")
+            
+            # *** NUEVA LÓGICA DE PRIORIDAD: Si la caída es EXTREMADAMENTE rápida ***
+            print(f"  --> Evaluación de prioridad: Caída extremadamente rápida (length_steep_slope <= {THRESHOLD_EXTREMELY_RAPID_FALL_GOOD}).")
+            if length_steep_slope < THRESHOLD_EXTREMELY_RAPID_FALL_GOOD:
+                # Si el pico cae casi inmediatamente, se considera Buena independientemente del score exacto en el codo.
+                return f"Buena (Pico en rango intermedio, caída EXTREMADAMENTE rápida y perfil {shape_type_adjective_profile})"
+            
+            # Lógica existente para caída rápida (pero no extremadamente) Y codo bajo
+            elif length_steep_slope <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY and is_elbow_score_below_threshold:
+                if is_concentrated_shape:
+                    return f"Buena (Pico en rango intermedio, caída muy rápida y concentrada - codo temprano y score bajo)"
+                else:
+                    return f"Buena (Pico en rango intermedio, caída muy rápida, pero con perfil distribuido - codo temprano y score bajo)"
+            else:
+                return f"Anomalía Leve (Pico en rango intermedio, caída {shape_type_adjective_profile} y sostenida)"
+    
+    # Fallback para cualquier caso no cubierto
+    return f"No clasificado (Revisar umbrales y lógica, perfil {shape_type_adjective_profile})"
+
+
+# Clasificar el resultado del análisis
+classification = classify_anomaly_type(analysis_results)
+print(f"\nClasificación Automática: {classification}")
+
+
+
+
 exit()
+
+
+
 
 
 
@@ -439,7 +636,7 @@ plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
 plt.colorbar(label='Puntuación de Anomalía Normalizada')
 plt.axis('off')
 
-heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_cut_010.png')
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_cut_013.png')
 plt.tight_layout()
 plt.savefig(heatmap_output_filename)
 print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
@@ -556,7 +753,7 @@ if len(detected_strong_anomaly_regions) > 0:
     ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
     plt.legend()
 
-    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_cut_010.png')
+    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_cut_013.png')
     plt.tight_layout()
     plt.savefig(strong_regions_overlay_output_filename)
     plt.close()
@@ -565,6 +762,11 @@ if len(detected_strong_anomaly_regions) > 0:
 end_time_all_plotting = time.time()
 print(f"Tiempo total para procesar y dibujar las regiones: {end_time_all_plotting - start_time_all_plotting:.4f} segundos")
 # --------------------------------------------------------------------------------------
+
+
+
+
+
 
 ##################################
 
