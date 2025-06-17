@@ -78,7 +78,12 @@ print("NearestNeighbors finder inicializado.")
 
 # --- Cargar Modelo DINOv2 ---
 print("Cargando modelo DINOv2...")
-upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=use_norm).to(device)
+#featup_local_path = "/home/imercatoma/FeatUp"
+#upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=use_norm, source='local').to(device)
+#upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=use_norm).to(device)
+featup_local_path = "/home/imercatoma/FeatUp"
+upsampler = torch.hub.load(featup_local_path, 'dinov2', use_norm=use_norm, source='local').to(device)
+
 dinov2_model = upsampler.model
 dinov2_model.eval()
 print("Modelo DINOv2 cargado.")
@@ -583,3 +588,98 @@ if sam2_model is not None:
     
 print(f"La imagen {base_image_name} fue clasificada como BUENA o el modelo SAM no se pudo cargar. No se generarán máscaras SAM.")
 print("\nAnálisis de detección de anomalías para una sola imagen completado.")
+
+# --- Implementación del punto 3.4.3. Object Feature Map ---
+import torch.nn.functional as F # Importa F para F.interpolate
+
+def process_masks_to_object_feature_maps(raw_masks, hr_feature_map, target_h, target_w, sam_processed_image_shape):
+    """
+    Procesa una lista de máscaras de SAM para obtener mapas de características de objeto.
+    Args:
+        raw_masks (list): Lista de diccionarios de máscaras crudas de SAM.
+                          Cada dict tiene una clave 'segmentation' (np.ndarray booleana).
+        hr_feature_map (torch.Tensor): Mapa de características de alta resolución (C, 8H', 8W').
+                                        Debe ser de la imagen correspondiente (query o reference).
+                                        Asegúrate de que ya esté en el dispositivo correcto.
+        target_h (int): Altura objetivo para la máscara escalada (8H').
+        target_w (int): Ancho objetivo para la máscara escalada (8W').
+        sam_processed_image_shape (tuple): La forma (H, W, C) de la imagen a la que SAM se aplicó
+                                           para generar las máscaras (ej. (1024, 1024, 3)).
+                                           Esto es crucial para escalar correctamente la máscara.
+    Returns:
+        torch.Tensor: Tensor de mapas de características de objeto (M, C, 8H', 8W').
+                      Si no hay máscaras, devuelve un tensor vacío (0, C, 8H', 8W').
+    """
+    if not raw_masks:
+        print("Advertencia: No se encontraron máscaras para procesar. Devolviendo tensor vacío.")
+        C_dim = hr_feature_map.shape[0] if hr_feature_map.ndim >=3 else 0
+        return torch.empty(0, C_dim, target_h, target_w, device=hr_feature_map.device)
+
+    object_feature_maps_list = []
+    C_dim = hr_feature_map.shape[0] # Número de canales de las características HR
+
+    for mask_info in raw_masks:
+        # Convertir la máscara booleana de numpy a tensor float y añadir dimensiones de lote y canal
+        mask_np = mask_info['segmentation'].astype(np.float32)
+        mask_tensor_original_res = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0) # (1, 1, H_orig, W_orig)
+        # Mover la máscara al mismo dispositivo que el mapa de características HR
+        mask_tensor_original_res = mask_tensor_original_res.to(hr_feature_map.device)
+
+        # 1. Escalar la máscara a (8H', 8W') usando interpolación bilineal
+        scaled_mask = F.interpolate(mask_tensor_original_res,
+                                     size=(target_h, target_w),
+                                     mode='bilinear',
+                                     align_corners=False)
+        # Opcional: Binarizar la máscara después del escalado si se requiere una máscara estricta (0 o 1)
+        scaled_mask = (scaled_mask > 0.5).float()
+
+        # 2. Multiplicación elemento a elemento con el mapa de características HR
+        if hr_feature_map.ndim == 3:
+            hr_feature_map_with_batch = hr_feature_map.unsqueeze(0) # -> (1, C, H, W)
+        else: # Si ya es (1, C, H, W)
+            hr_feature_map_with_batch = hr_feature_map
+
+        object_feature_map_i = scaled_mask * hr_feature_map_with_batch
+        object_feature_maps_list.append(object_feature_map_i)
+
+    # Concatenar todos los mapas de características de objeto
+    final_object_feature_maps = torch.cat(object_feature_maps_list, dim=0) # (M, C, 8H', 8W')
+
+    return final_object_feature_maps 
+# --- Aplicar el proceso a la imagen de consulta y a las imágenes de referencia ---
+
+print("\n--- Generando Mapas de Características de Objeto ---")
+
+# Dimensiones objetivo para las máscaras después de escalar (8H', 8W')
+TARGET_MASK_H = 8 * H_prime # 8 * 16 = 128
+TARGET_MASK_W = 8 * W_prime # 8 * 16 = 128
+# Para la imagen de consulta (Iq)
+fobj_q = process_masks_to_object_feature_maps(
+    masks_data_query_image, #query_masks_raw,
+    query_hr_feats.squeeze(0), # Pasamos (C, 8H', 8W') para que la función maneje el batch
+    TARGET_MASK_H,
+    TARGET_MASK_W,
+    image_for_sam_np.shape # Pasamos la forma real de la imagen que SAM procesó
+).to(device) # Mover a la GPU si no está ya
+
+print(f"Dimensiones de fobj_q (Mapas de Características de Objeto de Iq): {fobj_q.shape}") # Esperado (M, 384, 128, 128)
+
+# Para las imágenes de referencia (Ir)
+all_fobj_r_list = [] # Para almacenar fobj_r para cada imagen similar
+for i, similar_hr_feats in enumerate(similar_hr_feats_list):
+    current_similar_masks_raw = similar_masks_raw_list[i]
+    # Necesitamos obtener la forma original de la imagen similar para SAM
+    img_similar_pil = Image.open(rutas_imagenes_similares[i]).convert('RGB') # Cargar de nuevo para obtener su forma
+    image_np_similar_for_sam_shape = np.array(img_similar_pil).shape
+
+    fobj_r_current = process_masks_to_object_feature_maps(
+        current_similar_masks_raw,
+        similar_hr_feats.squeeze(0), # Pasamos (C, 8H', 8W')
+        TARGET_MASK_H,
+        TARGET_MASK_W,
+        image_np_similar_for_sam_shape # Pasamos la forma real de la imagen que SAM procesó
+    ).to(device) # Mover a la GPU
+    all_fobj_r_list.append(fobj_r_current)
+    print(f"Dimensiones de fobj_r para vecino {i+1}: {fobj_r_current.shape}") # Esperado (N, 384, 128, 128)
+
+print("\nProceso de 'Object Feature Map' completado. ¡Ahora tienes los fobj_q y fobj_r listos!")
