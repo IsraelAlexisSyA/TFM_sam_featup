@@ -5,654 +5,197 @@ import os
 from PIL import Image
 import matplotlib.pyplot as plt
 import torchvision.transforms as T
-# from sklearn.metrics.pairwise import euclidean_distances # Not directly used in final logic for distances
+from sklearn.metrics.pairwise import euclidean_distances
 import time
-
-# Import FeatUp utilities for normalization/denormalization
+#start_time = time.time() 
+# Importar las utilidades de FeatUp para normalización/desnormalización
 from featup.util import norm, unnorm
-# from featup.plotting import plot_feats # Not used in this specific plotting task
+from featup.plotting import plot_feats # Asegúrate de que esta importación sea correcta
+
 
 from sklearn.neighbors import NearestNeighbors
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter
-# from scipy.cluster.hierarchy import dendrogram, linkage # Not requested for batch plotting
-# from scipy.spatial.distance import pdist # Not requested for batch plotting
-# from sklearn.cluster import KMeans # Not requested for batch plotting
 
-from scipy.stats import median_abs_deviation
 
-# --- Configuration ---
+# --- Configuración Inicial ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_size = 224 # Input size for DINOv2
-BACKBONE_PATCH_SIZE = 14 # Patch size for DINOv2 ViT-S/14
-use_norm = True # Consistent with your approach
+input_size = 224 # Tamaño de entrada para DINOv2
+BACKBONE_PATCH_SIZE = 14 # Tamaño de parche para DINOv2 ViT-S/14
+use_norm = True # Coherente con tu enfoque
 
-# Spatial dimensions of low-resolution feature maps (H', W')
+# Las dimensiones espaciales de los mapas de características de baja resolución (H', W')
 H_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
 W_prime = input_size // BACKBONE_PATCH_SIZE # 224 // 14 = 16
 
-# Directories
-TRAIN_GOOD_DIR = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/train/good'
-TEST_CRACK_DIR = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/good' # Your target directory
-PLOT_SAVE_ROOT_DIR = '/home/imercatoma/FeatUp/plots_anomaly_distances' # New root for all distance plots
-os.makedirs(PLOT_SAVE_ROOT_DIR, exist_ok=True)
-print(f"Root plot save directory created/verified: '{PLOT_SAVE_ROOT_DIR}'")
+# Directorio de imágenes (ajusta según tu estructura)
+directorio_imagenes = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/train/good'
+query_image_path = '/home/imercatoma/FeatUp/datasets/mvtec_anomaly_detection/hazelnut/test/crack/000.png'
 
-# Paths for Coreset files (from Stage 1/previous steps)
-core_bank_filenames_file = os.path.join(TRAIN_GOOD_DIR, 'core_bank_filenames.pt')
-coreset_relevant_flat_features_bank_file = os.path.join(TRAIN_GOOD_DIR, 'coreset_relevant_flat_features_bank.pt')
-template_features_bank_coreset_file = os.path.join(TRAIN_GOOD_DIR, 'template_features_bank_coreset.pt') # This is your M
+# Rutas de archivo para cargar los mapas de características completos relevantes para el Coreset
+core_bank_features_file = os.path.join(directorio_imagenes, 'core_bank_features.pt') # no usado en este stage
+core_bank_filenames_file = os.path.join(directorio_imagenes, 'core_bank_filenames.pt')
+# --- NUEVO: Ruta para el banco de características del coreset relevante, ya aplanado y apilado ---
+coreset_relevant_flat_features_bank_file = os.path.join(directorio_imagenes, 'coreset_relevant_flat_features_bank.pt')
 
-# --- Load Coreset Data (The 'M' matrix for KNN) ---
-print("Loading relevant coreset data and feature bank (M)...")
+# coreset_features_file from Stage 1 (THIS IS YOUR M)
+template_features_bank_coreset_file = os.path.join(directorio_imagenes, 'template_features_bank_coreset.pt')# para mapa de calor
+
+
+# --- Cargar los datos del coreset relevante ---
+print("Cargando datos del coreset relevante...")
 coreset_relevant_filenames = []
-coreset_relevant_flat_features_bank = None
-coreset_features = None # This will be the actual 'M' matrix for KNN
+coreset_relevant_flat_features_bank = None # Este será el tensor aplanado y apilado
 
 try:
     coreset_relevant_filenames = torch.load(core_bank_filenames_file)
+    # Cargar el banco de características ya aplanado y apilado
     coreset_relevant_flat_features_bank = torch.load(coreset_relevant_flat_features_bank_file).to(device)
-    coreset_features = torch.load(template_features_bank_coreset_file).to(device) # Your 'M'
-    
-    print(f"Coreset of features (M) loaded. Dimension: {coreset_features.shape}")
-    print(f"Coreset relevant flat features bank loaded. Dimension: {coreset_relevant_flat_features_bank.shape}")
-    print(f"Number of relevant filenames loaded: {len(coreset_relevant_filenames)}")
+
+    print(f"Banco de características relevante (aplanado y apilado) cargado. Dimensión: {coreset_relevant_flat_features_bank.shape}")
+    print(f"Número de nombres de archivo relevantes cargados: {len(coreset_relevant_filenames)}")
+    if coreset_relevant_filenames:
+        print(f"Ejemplo de nombre de archivo relevante cargado: {coreset_relevant_filenames[0]}")
 
 except FileNotFoundError as e:
-    print(f"Error loading coreset files: {e}. Ensure Stage 1 was executed and files exist.")
-    exit()
+    print(f"Error al cargar archivos del coreset relevante: {e}. Asegúrate de que Stage 1 se haya ejecutado correctamente y los archivos existan.")
+    exit() # Salir si los archivos esenciales no se encuentran
 except Exception as e:
-    print(f"An error occurred loading or processing coreset files: {e}")
+    print(f"Ocurrió un error al cargar o procesar los archivos del coreset relevante: {e}")
     exit()
 
-# Move coreset to CPU for sklearn's NearestNeighbors
-coreset_features_cpu = coreset_features.cpu().numpy()
-print(f"Coreset features moved to CPU. Shape: {coreset_features_cpu.shape}")
 
-# Initialize NearestNeighbors finder once
-nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu)
-print("NearestNeighbors finder initialized with coreset features.")
+# Define donde quieres guardar el plot
+plot_save_directory_on_server = '/home/imercatoma/FeatUp/plots_a'# Nueva carpeta para esta etapa
+output_plot_filename = os.path.join(plot_save_directory_on_server, 'query_image_plot.png')
+os.makedirs(plot_save_directory_on_server, exist_ok=True)
 
-# --- Load DINOv2 Model ---
-print("Loading DINOv2 model for feature extraction...")
+# --- Extraer características de la imagen de consulta y buscar similares ---
+###########################
+query_img_pil = Image.open(query_image_path).convert('RGB')
+
+# Mostrar y guardar la imagen de consulta
+plt.imshow(query_img_pil)
+plt.title('Imagen de Consulta')
+plt.axis('off')
+plt.savefig(output_plot_filename)
+print(f"Plot de la imagen de consulta guardado en: {output_plot_filename}")
+plt.close() # Cerrar el plot para liberar memoria
+
+# --- Cargar modelo DINOv2 (a través de FeatUp) ---
+print("Cargando modelo DINOv2 para extracción de características de consulta...")
 upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=use_norm).to(device)
-dinov2_model = upsampler.model # Get the base DINOv2 model from the upsampler
-dinov2_model.eval() # Set model to evaluation mode
-print("DINOv2 model loaded.")
+dinov2_model = upsampler.model # Obtiene el modelo base DINOv2 del upsampler
+dinov2_model.eval() # Pone el modelo en modo de evaluación
+print("Modelo DINOv2 cargado.")
 
-# --- Image Transformation ---
+# --- Transformación Única para todas las imágenes ---
 transform = T.Compose([
     T.Resize(input_size),
     T.CenterCrop((input_size, input_size)),
-    T.ToTensor(), # Scales pixels to [0, 1] and changes to (C, H, W)
-    norm # Applies ImageNet normalization (mean/std)
+    T.ToTensor(), # Escala píxeles a [0, 1] y cambia a (C, H, W)
+    norm # Aplica normalización por media/std (normalización ImageNet)
 ])
 
-# --- Core Function to Get Anomaly Scores for an Image ---
-def get_anomaly_scores_for_image(image_path, model, image_transform, nn_finder_instance, H_prime, W_prime, device):
-    """
-    Extracts DINOv2 features for a single image, computes patch anomaly scores
-    based on distance to coreset.
-    Returns sorted_patch_anomaly_scores.
-    """
-    # 1. Extract DINOv2 features for the query image
-    try:
-        input_tensor = image_transform(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
-    except Exception as e:
-        print(f"  Error loading/transforming image {os.path.basename(image_path)}: {e}")
-        return None
-
+def extract_dinov2_features_lr(image_path, model, image_transform, device):
+    """Extrae características de baja resolución de DINOv2 usando la transformación dada."""
+    input_tensor = image_transform(Image.open(image_path).convert("RGB")).unsqueeze(0).to(device)
     with torch.no_grad():
-        features_lr = model(input_tensor) # (1, C, H', W')
+        features = model(input_tensor)
+    return features.cpu() # Mantener en CPU hasta que sea necesario
 
-    # 2. Flatten patches
-    query_patches_flat = features_lr.squeeze(0).permute(1, 2, 0).reshape(-1, features_lr.shape[1])
-    query_patches_flat_cpu = query_patches_flat.cpu().numpy()
+# Extraer características de la imagen de consulta
+query_lr_features = extract_dinov2_features_lr(query_image_path, dinov2_model, transform, device)
+print(f"Dimensiones de características de consulta (baja resolución): {query_lr_features.shape}")
 
-    # 3. Calculate distances to nearest neighbors in coreset
-    distances_to_nn, _ = nn_finder_instance.kneighbors(query_patches_flat_cpu)
-    patch_anomaly_scores = distances_to_nn.flatten() # (H'*W',)
+#########################################
+##################################
+# Medir el tiempo de generación del mapa de calor
+start_time_heatmap = time.time()
 
-    # 4. Sort anomaly scores in descending order
-    sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
+### AÑADIDO: Cálculo de distancias a nivel de parche y generación del mapa de calor ###
 
-    # Ensure it's 256 elements for consistency, though not strictly enforced in your previous code
-    # if sorted_patch_anomaly_scores.shape[0] != 256:
-    #     print(f"  Warning: Anomaly scores count is {sorted_patch_anomaly_scores.shape[0]}, not 256.")
+# Aplanar las características de la imagen de consulta para obtener vectores de parches
+# query_lr_features_map tiene forma (1, C, H', W')
+query_patches_flat = query_lr_features.squeeze(0).permute(1, 2, 0).reshape(-1, query_lr_features.shape[1])
+# query_patches_flat ahora tiene forma (H'*W', C) => (256, 384) para DINOv2-S/14
+print(f"Dimensiones de parches de consulta aplanados: {query_patches_flat.shape}")
 
-    return sorted_patch_anomaly_scores
+### AÑADIDO: INICIO DEL BLOQUE DE CÁLCULO DE MAPA DE CALOR Y Q-SCORE ###
+start_time_coreset_load = time.time()
 
-# --- Metric Calculation Functions (from previous steps) ---
-def calculate_rms(data):
-    """Calculates the Root Mean Square (RMS) of an array of data."""
-    return np.sqrt(np.mean(data**2))
+# --- Cargar el banco de memoria del Coreset (el verdadero M) ---
+print("Cargando el banco de memoria (coreset_features)...")
+coreset_features = None # Este será el tensor (Num_Coreset_Patches, C)
 
-def calculate_mad(data):
-    """Calculates the Median Absolute Deviation (MAD) of an array of data."""
-    return median_abs_deviation(data)
-
-def calculate_median(data):
-    """Calculates the Median of an array of data."""
-    return np.median(data)
-
-def calculate_quartile(data, q=25):
-    """Calculates a specific quartile (e.g., 25th percentile for Q1)."""
-    return np.percentile(data, q)
-
-
-# --- BATCH PROCESSING AND DATA COLLECTION ---
-image_names_processed = []
-rms_mad_distances = []
-rms_median_distances = []
-rms_q1_distances = []
-
-print(f"\nStarting batch processing of images from: {TEST_CRACK_DIR}")
 try:
-    test_image_files = [f for f in os.listdir(TEST_CRACK_DIR) if f.lower().endswith('.png')]
-    test_image_files.sort() # Ensure consistent order
-    if not test_image_files:
-        print(f"No .png images found in: {TEST_CRACK_DIR}")
-except FileNotFoundError:
-    print(f"Error: Directory '{TEST_CRACK_DIR}' not found.")
-    test_image_files = []
-
-for img_file in test_image_files:
-    full_image_path = os.path.join(TEST_CRACK_DIR, img_file)
-    print(f"Processing image: {img_file}")
-
-    # Get sorted anomaly scores for the current image
-    current_sorted_patch_anomaly_scores = get_anomaly_scores_for_image(
-        full_image_path, dinov2_model, transform, nn_finder, H_prime, W_prime, device
-    )
-
-    if current_sorted_patch_anomaly_scores is None:
-        print(f"  Skipping {img_file} due to processing error.")
-        continue # Skip to next image if error occurred
-
-    # --- Normalize Anomaly Scores ---
-    min_val = np.min(current_sorted_patch_anomaly_scores)
-    max_val = np.max(current_sorted_patch_anomaly_scores)
-
-    if max_val == min_val:
-        normalized_data = np.zeros_like(current_sorted_patch_anomaly_scores, dtype=float)
-        # print("  Warning: All anomaly scores are identical for this image. Normalized data will be all zeros.")
-    else:
-        normalized_data = (current_sorted_patch_anomaly_scores - min_val) / (max_val - min_val)
-
-    # --- Calculate Metrics from Normalized Data ---
-    A_rms = calculate_rms(normalized_data)
-    B_mad = calculate_mad(normalized_data)
-    C_median = calculate_median(normalized_data)
-    D_q1 = calculate_quartile(normalized_data, q=25) # 1st Quartile
-
-    # --- Calculate Distances ---
-    dist_rms_mad = A_rms - B_mad
-    dist_rms_median = A_rms - C_median
-    dist_rms_q1 = A_rms - D_q1
-
-    # Store results
-    image_names_processed.append(img_file)
-    rms_mad_distances.append(dist_rms_mad)
-    rms_median_distances.append(dist_rms_median)
-    rms_q1_distances.append(dist_rms_q1)
-
-    print(f"  Distances calculated for {img_file}:")
-    print(f"    (RMS - MAD): {dist_rms_mad:.4f}")
-    print(f"    (RMS - Mediana): {dist_rms_median:.4f}")
-    print(f"    (RMS - 1er Cuartil): {dist_rms_q1:.4f}")
-
-
-# --- Plotting Results ---
-
-if not image_names_processed:
-    print("\nNo image data was successfully processed for plotting.")
-else:
-    # Determine figure width dynamically based on number of images
-    num_images = len(image_names_processed)
-    fig_width = max(12, num_images * 0.8) # Ensure reasonable minimum width, scale for more images
-    x_positions = np.arange(num_images)
-
-    # --- Plot 1: RMS - MAD Distances ---
-    plt.figure(figsize=(fig_width, 7))
-    bars = plt.bar(x_positions, rms_mad_distances, color='purple', width=0.6)
-    plt.ylabel('Distance (RMS - MAD)', fontsize=12)
-    plt.title('RMS - MAD Distance per Image (Test: hazelnut/crack)', fontsize=14)
-    plt.xticks(x_positions, image_names_processed, rotation=60, ha='right', fontsize=10)
-    plt.yticks(fontsize=10)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.axhline(0, color='grey', linewidth=0.8, linestyle='--')
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.4f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
-    plt.tight_layout()
-    output_path_rms_mad = os.path.join(PLOT_SAVE_ROOT_DIR, 'distances_rms_mad_per_test_image.png')
-    plt.savefig(output_path_rms_mad)
-    print(f"\nPlot 'RMS - MAD per Image' saved to: '{output_path_rms_mad}'")
-    plt.close()
-
-    # --- Plot 2: RMS - Mediana Distances ---
-    plt.figure(figsize=(fig_width, 7))
-    bars = plt.bar(x_positions, rms_median_distances, color='orange', width=0.6)
-    plt.ylabel('Distance (RMS - Mediana)', fontsize=12)
-    plt.title('RMS - Mediana Distance per Image (Test: hazelnut/crack)', fontsize=14)
-    plt.xticks(x_positions, image_names_processed, rotation=60, ha='right', fontsize=10)
-    plt.yticks(fontsize=10)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.axhline(0, color='grey', linewidth=0.8, linestyle='--')
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.4f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
-    plt.tight_layout()
-    output_path_rms_median = os.path.join(PLOT_SAVE_ROOT_DIR, 'distances_rms_median_per_test_image.png')
-    plt.savefig(output_path_rms_median)
-    print(f"Plot 'RMS - Mediana per Image' saved to: '{output_path_rms_median}'")
-    plt.close()
-
-    # --- Plot 3: RMS - 1st Quartile (Q1) Distances ---
-    plt.figure(figsize=(fig_width, 7))
-    bars = plt.bar(x_positions, rms_q1_distances, color='cyan', width=0.6)
-    plt.ylabel('Distance (RMS - 1er Cuartil)', fontsize=12)
-    plt.title('RMS - 1er Cuartil Distance per Image (Test: hazelnut/crack)', fontsize=14)
-    plt.xticks(x_positions, image_names_processed, rotation=60, ha='right', fontsize=10)
-    plt.yticks(fontsize=10)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.axhline(0, color='grey', linewidth=0.8, linestyle='--')
-    for bar in bars:
-        yval = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.4f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
-    plt.tight_layout()
-    output_path_rms_q1 = os.path.join(PLOT_SAVE_ROOT_DIR, 'distances_rms_q1_per_test_image.png')
-    plt.savefig(output_path_rms_q1)
-    print(f"Plot 'RMS - 1er Cuartil per Image' saved to: '{output_path_rms_q1}'")
-    plt.close()
-
-print("\nBatch anomaly detection and metric analysis complete.")
-
-
-
-
-
-exit()
-
-
-
-
-
-
-
-
-
-################# saber si existe o no anomalias con tecnicas DWT y codo en pendiente #################
-import numpy as np
-import pywt # Importar la librería PyWavelets
-import matplotlib.pyplot as plt
-import os
-from kneed import KneeLocator # Importar KneeLocator
-# Simulación de plot_save_directory_on_server
-# Reemplaza con tu ruta real donde quieras guardar las imágenes
-#plot_save_directory_on_server = 'plots_wavelet'
-
-
-
-
-print("Top scores de anomalía (1% superior):")
-print(top_anomaly_scores)
-# Ordenar los patch_anomaly_scores de forma descendente
-sorted_patch_anomaly_scores = np.sort(patch_anomaly_scores)[::-1]
-
-print("Top scores de anomalía (primeros 12, para referencia):")
-print(sorted_patch_anomaly_scores[:12])
-print(f"Total de scores: {len(sorted_patch_anomaly_scores)}")
-
-# --- Preservar el score máximo original antes de normalizar ---
-original_max_score = sorted_patch_anomaly_scores[0]
-print(f"\nScore máximo original (sin normalizar): {original_max_score:.6f}")
-
-
-# --- ESTRATEGIA A: NORMALIZACIÓN DE LOS SCORES ---
-# Normalizar los scores al rango [0, 1]
-if sorted_patch_anomaly_scores.max() > sorted_patch_anomaly_scores.min():
-    normalized_scores = (sorted_patch_anomaly_scores - sorted_patch_anomaly_scores.min()) / \
-                        (sorted_patch_anomaly_scores.max() - sorted_patch_anomaly_scores.min())
-    print("Scores de anomalía normalizados al rango [0, 1].")
-else:
-    normalized_scores = np.zeros_like(sorted_patch_anomaly_scores)
-    print("Todos los scores de anomalía son iguales, normalizados a cero.")
-
-# A partir de aquí, usa normalized_scores para todos los cálculos
-current_scores_for_analysis = normalized_scores
-
-# --- Aplicar la Transformada Wavelet Discreta (DWT) ---
-wavelet = 'db4'
-level = 1
-coeffs = pywt.wavedec(current_scores_for_analysis, wavelet, level=level)
-
-if level == 1:
-    cD1 = coeffs[1]
-else:
-    cD1 = coeffs[-1]
-
-print(f"\nNúmero de coeficientes de detalle (cD1): {len(cD1)}")
-print(f"Los 10 primeros coeficientes de detalle (cD1): {cD1[:10]}")
-
-# --- Calcular métricas de los coeficientes de detalle ---
-N_coeffs_to_consider = min(len(cD1), 20) # Considerar los primeros 20 coefs o menos si cD1 es más corto
-abs_sum_cD1 = np.sum(np.abs(cD1[:N_coeffs_to_consider]))
-energy_cD1 = np.sum(cD1[:N_coeffs_to_consider]**2)
-max_abs_cD1 = np.max(np.abs(cD1[:N_coeffs_to_consider]))
-
-print(f"\nCaracterísticas de cD1 (primeros {N_coeffs_to_consider} coeficientes) de scores normalizados:")
-print(f"   Suma Absoluta (abs_sum_cD1): {abs_sum_cD1:.6f}")
-print(f"   Energía (energy_cD1): {energy_cD1:.6f}")
-print(f"   Máximo Absoluto (max_abs_cD1): {max_abs_cD1:.6f}")
-
-# --- Detección de "Codo" basada en cambio de pendiente ---
-elbow_point_index = None
-length_steep_slope = 0
-
-search_range = min(len(current_scores_for_analysis), 100) # Buscar el codo en los primeros 100 puntos
-scores_to_analyze_for_slope = current_scores_for_analysis[:search_range]
-x_indices = np.arange(search_range)
-
-if len(scores_to_analyze_for_slope) > 1:
-    slopes = np.abs(np.diff(scores_to_analyze_for_slope))
-
-    if len(slopes) > 0:
-        initial_slope_points = min(5, len(slopes))
-        max_initial_slope = np.mean(slopes[:initial_slope_points])
-        
-        # --- AJUSTE CLAVE AQUÍ: Definir slope_threshold_multiplier condicionalmente ---
-        slope_threshold_multiplier = 0.2 # Valor predeterminado
-        
-        # Si la primera pendiente es extremadamente pequeña en relación con el promedio inicial,
-        # lo que sugiere una estabilización casi inmediata (length_steep_slope sería 1).
-
-        # Si la primera pendiente es muy pequeña en relación con el promedio inicial,
-        # lo que sugiere una estabilización casi inmediata (length_steep_slope sería 1).
-        if max_initial_slope > 1e-6: # Evitar división por cero
-            # Aumentamos el umbral para que la condición sea TRUE más fácilmente
-            # Por ejemplo, si slopes[0] es menor que el 10% del promedio inicial
-            if slopes[0] < (max_initial_slope * 0.10): # Ajustado de 0.01 a 0.10
-                slope_threshold_multiplier = 0.02 # O 0.001 si esa es tu intención final
-                print(f"  --> Ajustando slope_threshold_multiplier a {slope_threshold_multiplier:.2f} (caída inicial muy abrupta).")
- 
-        
-        slope_threshold = max_initial_slope * slope_threshold_multiplier
-        
-        print(f"\nCalculando codo por umbral de pendiente (en scores normalizados):")
-        print(f"   Pendiente inicial promedio ({initial_slope_points} pts): {max_initial_slope:.6f}")
-        print(f"   Umbral de pendiente para detección de codo: {slope_threshold:.6f}")
-        print(f"   Multiplicador de umbral de pendiente usado: {slope_threshold_multiplier:.2f}")
-
-        print(f"\nPrimeros 5 scores normalizados: {current_scores_for_analysis[:5]}")
-        if len(slopes) > 0:
-            print(f"Primeros 5 valores de pendientes (abs): {slopes[:5]}")
-            print(f"max_initial_slope: {max_initial_slope:.6f}")
-            print(f"slope_threshold actual: {slope_threshold:.6f}")
-        
-
-        for i in range(len(slopes)):
-            if slopes[i] < slope_threshold:
-                elbow_point_index = i + 1
-                break
-    
-    if elbow_point_index is not None:
-        length_steep_slope = elbow_point_index
-        print(f"Codo detectado (Umbral de Pendiente): {elbow_point_index}, Longitud: {length_steep_slope}")
-    else:
-        length_steep_slope = len(scores_to_analyze_for_slope) 
-        print(f"No se detectó un punto de 'codo' claro con el umbral de pendiente.")
-        print(f"Longitud estimada de la pendiente inclinada (asumiendo toda la porción analizada): {length_steep_slope} puntos")
-else:
-    length_steep_slope = 0
-    print("\nNo hay suficientes scores para calcular la pendiente para la detección de codo.")
-
-if elbow_point_index is None and len(scores_to_analyze_for_slope) <= 1:
-    elbow_point_index = None
-    length_steep_slope = 0
-
-# --- Calcular el score original en la ubicación del codo ---
-score_at_elbow_original = None
-if elbow_point_index is not None and elbow_point_index < len(sorted_patch_anomaly_scores):
-    score_at_elbow_original = sorted_patch_anomaly_scores[elbow_point_index]
-    print(f"Score en el punto del codo (Original): {score_at_elbow_original:.6f}")
-else:
-    score_at_elbow_original = float('inf') 
-
-# --- Visualizar los Coeficientes de Detalle (cD1) y el Codo ---
-plt.figure(figsize=(14, 7))
-
-plt.subplot(2, 1, 1)
-plt.plot(current_scores_for_analysis, label='Scores de Anomalía Ordenados (Normalizados)', color='blue')
-if elbow_point_index is not None and elbow_point_index < len(current_scores_for_analysis):
-    plt.axvline(x=elbow_point_index, color='green', linestyle='--', label=f'Codo detectado (índice: {elbow_point_index})')
-    plt.plot(elbow_point_index, current_scores_for_analysis[elbow_point_index], 'go', markersize=8)
-plt.title("Scores de Anomalía Ordenados (Normalizados) con Codo Detectado")
-plt.xlabel("Índice")
-plt.ylabel("Score Normalizado")
-plt.grid(True)
-plt.legend()
-
-plt.subplot(2, 1, 2)
-x_axis_cD1 = np.linspace(0, len(current_scores_for_analysis) - 1, len(cD1))
-plt.plot(x_axis_cD1, cD1, label=f'Coeficientes de Detalle (cD1, Wavelet: {wavelet})', color='red')
-plt.axhline(y=0.01, color='purple', linestyle=':', label='Mini-umbral 0.01 (referencia para cD1)')
-plt.axhline(y=-0.01, color='purple', linestyle=':') 
-plt.title(f"Coeficientes de Detalle (cD1) de la Transformada Wavelet Discreta")
-plt.xlabel("Posición aproximada en la secuencia original")
-plt.ylabel("Amplitud del Coeficiente de Detalle")
-plt.grid(True)
-plt.legend()
-
-plt.tight_layout()
-
-output_dwt_coeffs_plot_filename = os.path.join(plot_save_directory_on_server, 'dwt_detail_coefficients_normalized_with_elbow.png')
-plt.savefig(output_dwt_coeffs_plot_filename)
-print(f"\nPlot de los coeficientes de detalle DWT y codo guardado en: {output_dwt_coeffs_plot_filename}")
-plt.close()
-
-# --- Consolidar resultados para clasificación ---
-analysis_results = {
-    'original_max_score': original_max_score, 
-    'max_score': current_scores_for_analysis[0],
-    'abs_sum_cD1': abs_sum_cD1,
-    'energy_cD1': energy_cD1,
-    'max_abs_cD1': max_abs_cD1,
-    'elbow_point_index': elbow_point_index,
-    'length_steep_slope': length_steep_slope,
-    'score_at_elbow_original': score_at_elbow_original,
-}
-
-print("\n--- Resultados del Análisis (incluye Original Max Score) ---")
-for key, value in analysis_results.items():
-    if isinstance(value, float):
-        print(f"{key}: {value:.6f}")
-    else:
-        print(f"{key}: {value}")
-
-
-# --- Lógica de Clasificación con la nueva estrategia ---
-
-def classify_anomaly_type(results: dict):
-    original_max_score = results['original_max_score']
-    abs_sum_cD1 = results['abs_sum_cD1']
-    length_steep_slope = results['length_steep_slope']
-    max_abs_cD1 = results['max_abs_cD1']
-    score_at_elbow_original = results['score_at_elbow_original']
-
-    # --- UMBRALES CLAVE DE CLASIFICACIÓN (AJUSTAR CUIDADOSAMENTE) ---
-    THRESHOLD_ORIGINAL_MAX_LARGE = 0.30
-    THRESHOLD_ORIGINAL_MAX_MILD_MIN = 0.15 
-    
-    THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD = 0.17 
-
-    THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY = 10 
-    
-    # Este umbral no se usa directamente en la lógica de clasificación con el cambio actual,
-    # ya que la decisión de "caída extremadamente rápida" ahora se basa más en el THRESHOLD_SCORE_AT_ELBOW_GOOD
-    # y la lógica del codo.
-    # THRESHOLD_EXTREMELY_RAPID_FALL_GOOD = 2 
-
-    # Los demás umbrales se mantienen como los indicados en tu último log o por defecto
-    THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR = 0.25
-    THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR = 0.60 
-    THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD = 0.08 
-    
-    # Ajustado de 0.30 a 0.20
-    THRESHOLD_SCORE_AT_ELBOW_GOOD = 0.20 
-    
-    # Inicializar is_elbow_score_below_threshold antes de usarla
-    is_elbow_score_below_threshold = False 
-    if score_at_elbow_original is not None and score_at_elbow_original != float('inf'):
-        is_elbow_score_below_threshold = (score_at_elbow_original < THRESHOLD_SCORE_AT_ELBOW_GOOD)
-
-
-    # Calcular la nueva métrica de "concentración de cambio"
-    concentration_of_change = max_abs_cD1 / abs_sum_cD1 if abs_sum_cD1 != 0 else 0
-
-    print(f"\n--- Clasificando ---")
-    print(f"  Original Max Score: {original_max_score:.6f}")
-    print(f"  Suma Abs cD1 (Normalizado): {abs_sum_cD1:.6f}")
-    print(f"  Máx Abs cD1 (Normalizado): {max_abs_cD1:.6f}")
-    print(f"  Concentración de Cambio (MaxAbsCD1/AbsSumCD1): {concentration_of_change:.6f}")
-    print(f"  Longitud Pendiente (Ubicación del Codo): {length_steep_slope}")
-    print(f"  Score en el Codo (Original): {score_at_elbow_original:.6f}") 
-
-    # --- Generar el descriptor de forma (para integrar directamente en la frase) ---
-    is_concentrated_shape = concentration_of_change > THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR
-    shape_type_adjective_profile = "concentrado" if is_concentrated_shape else "distribuido"
-
-
-    # --- LÓGICA DE CLASIFICACIÓN ---
-    print("\n--- Evaluación de Condiciones ---")
-    print(f"original_max_score ({original_max_score:.6f}) > THRESHOLD_ORIGINAL_MAX_LARGE ({THRESHOLD_ORIGINAL_MAX_LARGE:.2f}): {original_max_score > THRESHOLD_ORIGINAL_MAX_LARGE}")
-    print(f"original_max_score ({original_max_score:.6f}) < THRESHOLD_ORIGINAL_MAX_MILD_MIN ({THRESHOLD_ORIGINAL_MAX_MILD_MIN:.2f}): {original_max_score < THRESHOLD_ORIGINAL_MAX_MILD_MIN}")
-    print(f"length_steep_slope ({length_steep_slope}) <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY ({THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY}): {length_steep_slope <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY}")
-    print(f"is_elbow_score_below_threshold ({score_at_elbow_original:.6f} < {THRESHOLD_SCORE_AT_ELBOW_GOOD:.2f}): {is_elbow_score_below_threshold}")
-    print(f"abs_sum_cD1 ({abs_sum_cD1:.6f}) < THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD ({THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD:.2f}): {abs_sum_cD1 < THRESHOLD_CD1_ACTIVITY_VERY_LOW_GOOD}")
-    print(f"concentration_of_change ({concentration_of_change:.6f}) > THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR ({THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR:.2f}): {concentration_of_change > THRESHOLD_CONCENTRATION_HIGH_FOR_GOOD_INDICATOR}")
-    print(f"concentration_of_change ({concentration_of_change:.6f}) > THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR ({THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR:.2f}): {concentration_of_change > THRESHOLD_CONCENTRATION_FOR_SHAPE_DESCRIPTOR}")
-
-
-    # 1. Anomalía GRANDE (Score de pico original muy alto)
-    if original_max_score > THRESHOLD_ORIGINAL_MAX_LARGE:
-        print("Entra en: Anomalía Grande (Pico muy alto)")
-        return f"Anomalía Grande (Pico muy alto, perfil {shape_type_adjective_profile})"
-
-    # 2. IMAGEN BUENA (Score de pico original BAJO - ¡Se da por sentado!)
-    elif original_max_score < THRESHOLD_ORIGINAL_MAX_MILD_MIN: 
-        print("  --> Entra en la condición de 'Buena' por score original BAJO (incondicional).")
-        return f"Buena (Score pico muy bajo, perfil {shape_type_adjective_profile} y baja actividad general)"
-            
-    # 3. RANGO INTERMEDIO (0.15 a 0.30) - Aquí se subdivide
-    elif original_max_score >= THRESHOLD_ORIGINAL_MAX_MILD_MIN and original_max_score <= THRESHOLD_ORIGINAL_MAX_LARGE:
-        print("  --> Dentro del rango de scores originales intermedios (0.15-0.30).")
-
-        # Sub-clasificación para scores MUY BAJOS dentro del rango intermedio (0.15 a < 0.17)
-        if original_max_score < THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD: 
-            print(f"  --> Dentro del sub-rango intermedio muy bajo (< {THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD:.2f}).")
-            if is_elbow_score_below_threshold:
-                return f"Buena (Pico muy bajo en rango intermedio, perfil {shape_type_adjective_profile} - codo temprano y score bajo)"
-            else:
-                return f"Límite: Falla muy pequeña (Pico muy bajo, perfil {shape_type_adjective_profile} - codo no tan bajo)"
-        
-        # Clasificación para el resto del rango intermedio (0.17 a 0.30)
-        else: # original_max_score >= THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD
-            print(f"  --> Dentro del sub-rango intermedio medio/alto (>= {THRESHOLD_ORIGINAL_MAX_VERY_MILD_GOOD_THRESHOLD:.2f}).")
-            
-            # La condición para "caída extremadamente rápida" ahora se gestiona por la precisión del codo y el umbral de score.
-            # Se ha eliminado el 'THRESHOLD_EXTREMELY_RAPID_FALL_GOOD' como una prioridad separada aquí
-            # para evitar contradicciones con el objetivo de clasificar el caso anterior como "Anomalía Leve".
-
-            # Lógica para caída rápida (pero no extremadamente) Y codo bajo
-            if length_steep_slope <= THRESHOLD_LENGTH_STEEP_GOOD_VS_ANOMALY and is_elbow_score_below_threshold:
-                if is_concentrated_shape:
-                    return f"Buena (Pico en rango intermedio, caída muy rápida y concentrada - codo temprano y score bajo)"
-                else:
-                    return f"Buena (Pico en rango intermedio, caída muy rápida, pero con perfil distribuido - codo temprano y score bajo)"
-            else:
-                # Este caso incluye aquellos con caída rápida pero score en el codo no lo suficientemente bajo.
-                return f"Anomalía Leve (Pico en rango intermedio, caída {shape_type_adjective_profile} y sostenida)"
-    
-    # Fallback para cualquier caso no cubierto
-    return f"No clasificado (Revisar umbrales y lógica, perfil {shape_type_adjective_profile})"
-
-
-# Clasificar el resultado del análisis
-classification = classify_anomaly_type(analysis_results)
-print(f"\nClasificación Automática: {classification}")
-
-
-
-
-exit()
-
-
-
-
-
-
-
-
-
-# Aplicar K-Means con 2 clusters a sorted_patch_anomaly_scores
-num_clusters_kmeans_2 = 2
-kmeans_2 = KMeans(n_clusters=num_clusters_kmeans_2, random_state=42)
-kmeans_2_labels = kmeans_2.fit_predict(sorted_patch_anomaly_scores.reshape(-1, 1))
-
-# Agrupar los datos en variables según las etiquetas de los clusters
-cluster_0_data = sorted_patch_anomaly_scores[kmeans_2_labels == 0]
-cluster_1_data = sorted_patch_anomaly_scores[kmeans_2_labels == 1]
-
-# Visualizar los clusters
-plt.figure(figsize=(10, 6))
-plt.scatter(range(len(cluster_0_data)), cluster_0_data, label='Cluster 0', color='blue')
-plt.scatter(range(len(cluster_0_data), len(cluster_0_data) + len(cluster_1_data)), cluster_1_data, label='Cluster 1', color='orange')
-plt.title("K-Means Clustering (k=2) en sorted_patch_anomaly_scores")
-plt.xlabel("Índice")
-plt.ylabel("Puntuación de Anomalía")
-plt.legend()
-plt.tight_layout()
-
-# Guardar el plot en un archivo
-output_kmeans_2_plot_filename = os.path.join(plot_save_directory_on_server, 'kmeans_2_sorted_patch_anomaly_scores.png')
-plt.savefig(output_kmeans_2_plot_filename)
-print(f"Plot de K-Means con 2 clusters guardado en: {output_kmeans_2_plot_filename}")
-plt.close()
-
-# Imprimir los datos agrupados como vectores
-print("Cluster 0 Data:", cluster_0_data)
-print("Cluster 1 Data:", cluster_1_data)
-# Calcular RMS (Root Mean Square) para Cluster 0
-if len(cluster_0_data) > 0:
-    rms_cluster_0 = np.sqrt(np.mean(np.square(cluster_0_data)))
-    print(f"RMS para Cluster 0: {rms_cluster_0:.4f}")
-else:
-    rms_cluster_0 = 0
-    print("Cluster 0 está vacío. RMS establecido en 0.")
-
-# Calcular AVG (Average) para Cluster 1
-if len(cluster_1_data) > 0:
-    avg_cluster_1 = np.mean(cluster_1_data)
-    print(f"AVG para Cluster 1: {avg_cluster_1:.4f}")
-else:
-    avg_cluster_1 = 0
-    print("Cluster 1 está vacío. AVG establecido en 0.")
-
-# Calcular la diferencia entre RMS de Cluster 0 y AVG de Cluster 1
-difference = rms_cluster_0 - avg_cluster_1
-print(f"Diferencia (RMS Cluster 0 - AVG Cluster 1): {difference:.4f}")
-
-
-print("Sorted patch anomaly scores (descending):")
-print(sorted_patch_anomaly_scores)
-
+    # --- ESTA ES LA LÍNEA QUE CARGA coreset_features ---
+    coreset_features = torch.load(template_features_bank_coreset_file).to(device)
+    print(f"Coreset de características (M) cargado. Dimensión: {coreset_features.shape}")
+
+except FileNotFoundError as e:
+    print(f"Error al cargar el coreset de características: {e}. Asegúrate de que Stage 1 se haya ejecutado correctamente y el archivo '{template_features_bank_coreset_file}' exista.")
+    exit() # Salir si el archivo esencial no se encuentra
+except Exception as e:
+    print(f"Ocurrió un error al cargar o procesar el coreset de características: {e}")
+    exit()
+
+end_time_coreset_load = time.time()
+print(f"Tiempo para cargar el coreset: {end_time_coreset_load - start_time_coreset_load:.4f} segundos")
+
+
+
+# Mover el coreset a CPU para sklearn, si no quieres usar Faiss/torch.cdist (más complejo)
+coreset_features_cpu = coreset_features.cpu().numpy()
+query_patches_flat_cpu = query_patches_flat.cpu().numpy()
+
+# 1. Calcular distancias de coseno entre cada parche de consulta y el coreset
+print("\nCalculando distancias de coseno a nivel de parche...")
+start_time_distances = time.time()
+
+# Usar NearestNeighbors para encontrar el vecino más cercano y su distancia
+from sklearn.neighbors import NearestNeighbors
+# n_neighbors=1 porque solo queremos la distancia al más cercano
+# metric='cosine' para distancia de coseno
+# algorithm='brute' es simple, para grandes coreset, 'kd_tree' o 'ball_tree' o Faiss son mejores
+nn_finder = NearestNeighbors(n_neighbors=1, algorithm='brute', metric='cosine').fit(coreset_features_cpu)
+distances_to_nn, _ = nn_finder.kneighbors(query_patches_flat_cpu)
+# distances_to_nn tendrá forma (H'*W', 1)
+patch_anomaly_scores = distances_to_nn.flatten() # Forma (H'*W',)
+end_time_distances = time.time()
+print(f"Tiempo para calcular distancias de parches: {end_time_distances - start_time_distances:.4f} segundos")
+print(f"Forma de las puntuaciones de anomalía de parches: {patch_anomaly_scores.shape}")
+
+# 2. Generar el mapa de calor (heatmap)
+# Reorganizar las puntuaciones de los parches a la forma espacial (H', W')
+anomaly_map_lr = patch_anomaly_scores.reshape(H_prime, W_prime)
+print(f"Forma del mapa de anomalías de baja resolución: {anomaly_map_lr.shape}")
+
+# Upsampling Bilineal a la resolución de entrada original
+# Convertir a tensor PyTorch, añadir dimensiones de batch y canal, y mover a device
+anomaly_map_lr_tensor = torch.from_numpy(anomaly_map_lr).unsqueeze(0).unsqueeze(0).to(device) # Forma (1, 1, H', W')
+anomaly_map_upsampled = F.interpolate(anomaly_map_lr_tensor, size=(input_size, input_size), mode='bilinear', align_corners=False)
+anomaly_map_upsampled = anomaly_map_upsampled.squeeze().cpu().numpy() # Quitar dimensiones de batch/canal, a numpy
+
+# Suavizado Gaussiano (opcional, pero recomendado por el paper)
+# sigma = 4.0 es el valor del paper
+anomaly_map_smoothed = gaussian_filter(anomaly_map_upsampled, sigma=4.0)
+
+# Normalizar el mapa de anomalías para visualización (opcional, pero útil)
+# Escalar a [0, 1] o [0, 255]
+anomaly_map_final = (anomaly_map_smoothed - anomaly_map_smoothed.min()) / (anomaly_map_smoothed.max() - anomaly_map_smoothed.min() + 1e-8)
+
+print(f"Forma del mapa de calor final: {anomaly_map_final.shape}")
+
+# 3. Calcular el q-score (puntuación a nivel de imagen)
+# Tomar el 1% de las puntuaciones de anomalía de parche más altas
+num_top_patches = int(len(patch_anomaly_scores) * 0.01)
+if num_top_patches == 0 and len(patch_anomaly_scores) > 0: # Asegurarse de tomar al menos 1 si hay parches
+    num_top_patches = 1
+
+top_anomaly_scores = np.sort(patch_anomaly_scores)[-num_top_patches:]
 q_score = np.mean(top_anomaly_scores)
 print(f"Q-score (promedio del 1% superior de distancias): {q_score:.4f}")
-
-# Determinar si hay anomalía estructural basada en el Q-score
-anomalia_estructural = q_score > 0.27 #aqui es o no Anomalia estructural
-print(f"Anomalía estructural: {'Sí' if anomalia_estructural else 'No'}")
 
 
 # 4. Visualización del mapa de calor
@@ -670,7 +213,7 @@ plt.title(f'Mapa de Anomalía (Q-score: {q_score:.2f})')
 plt.colorbar(label='Puntuación de Anomalía Normalizada')
 plt.axis('off')
 
-heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_hole_000.png')
+heatmap_output_filename = os.path.join(plot_save_directory_on_server, 'anomaly_heatmap_crack_000.png')
 plt.tight_layout()
 plt.savefig(heatmap_output_filename)
 print(f"Mapa de calor de anomalías guardado en: {heatmap_output_filename}")
@@ -681,63 +224,70 @@ print("\n--- ¡Generación del mapa de calor y q-score completada! ---")
 
 end_time_heatmap = time.time()
 print(f"Tiempo para generar el mapa de calor: {end_time_heatmap - start_time_heatmap:.4f} segundos")
-exit( )
-# Salir del script si no se detecta anomalía estructural
-# if not anomalia_estructural:
-#     print("No se detectó anomalía estructural. Saliendo del script.")
-#     exit()
 
-# Visualización de regiones en la imagen de consulta
 ###########################################################################
+start_time_point_heatmap = time.time()
+### AÑADIDO: INICIO DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN REVISADA ###
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 from PIL import Image
+import matplotlib.patches as patches
 from skimage import measure # Para componentes conectados y propiedades de región
-import matplotlib.patches as patches # Para dibujar rectángulos
-import time # Asegúrate de importar time
 
-# --- Variables de configuración y resultados previos (ejemplo, asegúrate de que existen en tu script principal) ---
+# --- Variables de configuración y resultados previos que ya deben estar definidos: ---
 # anomaly_map_final (el heatmap normalizado de 0 a 1)
 # query_img_pil (la imagen original PIL)
-# plot_save_directory_on_server (directorio donde guardar los plots)
-# input_size (el tamaño al que se escaló la imagen para DINOv2 y el heatmap, ej. 224)
+# plot_save_directory_on_server
+# input_size (el tamaño al que se escaló la imagen para DINOv2 y el heatmap)
 # q_score (la puntuación general de la imagen)
-# patch_anomaly_scores (array 1D con las distancias de anomalía por parche)
-# H_prime, W_prime (dimensiones del mapa de características LR, ej. 16, 16)
-# BACKBONE_PATCH_SIZE (ej. 14 para DINOv2)
 
 
-# --------------------------------------------------------------------------------------
-# Tiempo total del proceso de detección y visualización de regiones
-start_time_all_plotting = time.time()
-# --------------------------------------------------------------------------------------
+### AÑADIDO: INICIO DEL BLOQUE DE DETECCIÓN DE REGIONES FUERTES DE ANOMALÍA ###
 
+# --- 5. Detección y visualización de regiones de anomalía "fuertes" ---
 
-# --- Detección y visualización de regiones de anomalía "fuertes" (con rectángulos) ---
+print("\nBuscando y visualizando regiones con anomalías fuertes en el mapa de calor...")
 
-start_time_calc_strong_regions = time.time() # Inicio del temporizador para el cálculo de regiones fuertes
+# Define un umbral para las "regiones fuertes de anomalía".
+# Este valor es crítico. Un valor cercano a 1 (ej. 0.7, 0.8, 0.9) buscará las áreas más intensas.
+# Puedes ajustarlo según qué tan "fuerte" quieras que sea la anomalía.
+strong_anomaly_region_threshold = 0.75 # Ajusta este valor (ej. 0.7, 0.8, 0.9)
 
-strong_anomaly_region_threshold = 0.75 # Ajusta este valor para definir qué es una anomalía "fuerte"
-min_region_pixel_area = 50 # Tamaño mínimo de píxeles para considerar una región (en la resolución del heatmap)
-
+# Crea una máscara binaria donde los píxeles superan el umbral
 binary_strong_anomaly_map = anomaly_map_final > strong_anomaly_region_threshold
 
-detected_strong_anomaly_regions = [] # Lista para guardar los bounding boxes de las regiones detectadas
-
-# Calcula factores de escala (necesarios si no los tienes calculados previamente en el script principal)
-original_img_width, original_img_height = query_img_pil.size
-scale_x = original_img_width / input_size
-scale_y = original_img_height / input_size
-
-if np.any(binary_strong_anomaly_map):
+# Asegúrate de que la máscara binaria no esté vacía antes de intentar etiquetar
+if not np.any(binary_strong_anomaly_map):
+    print(f"No se encontraron píxeles por encima del umbral de {strong_anomaly_region_threshold} para regiones fuertes de anomalía. Reduce el umbral si es necesario.")
+else:
+    # Etiquetar las regiones conectadas en la máscara binaria
+    # Cada región conectada tendrá un ID único (ej. 1, 2, 3...)
     labeled_anomaly_regions = measure.label(binary_strong_anomaly_map)
+
+    # Obtener propiedades de cada región, como el bounding box
+    # 'bbox' devuelve (min_row, min_col, max_row, max_col)
+    # 'area' es el número de píxeles en la región
     region_properties = measure.regionprops(labeled_anomaly_regions)
+
+    detected_strong_anomaly_regions = []
+
+    # Filtra las regiones por un tamaño mínimo (opcional, para evitar ruido)
+    min_region_pixel_area = 50 # Tamaño mínimo de píxeles para considerar una región (ajusta si es necesario)
+
+    print(f"Analizando {len(region_properties)} regiones conectadas antes de filtrar.")
     
     for region in region_properties:
         if region.area >= min_region_pixel_area:
             # bbox de skimage es (min_row, min_col, max_row, max_col)
             min_y_at_input_size, min_x_at_input_size, max_y_at_input_size, max_x_at_input_size = region.bbox
+
+            # Escalar las coordenadas al tamaño de la imagen original
+            original_img_width, original_img_height = query_img_pil.size
+            scale_x = original_img_width / input_size
+            scale_y = original_img_height / input_size
 
             scaled_min_x = int(min_x_at_input_size * scale_x)
             scaled_min_y = int(min_y_at_input_size * scale_y)
@@ -748,58 +298,66 @@ if np.any(binary_strong_anomaly_map):
             region_width = scaled_max_x - scaled_min_x
             region_height = scaled_max_y - scaled_min_y
 
+            # Calcular el centroide de la región (opcional, si quieres un punto en el centro de la región)
+            # centroid_y_at_input_size, centroid_x_at_input_size = region.centroid
+            # scaled_centroid_x = int(centroid_x_at_input_size * scale_x)
+            # scaled_centroid_y = int(centroid_y_at_input_size * scale_y)
+
+
             detected_strong_anomaly_regions.append({
                 'bbox': (scaled_min_x, scaled_min_y, region_width, region_height),
-                'area_pixels': region.area
+                # 'centroid': (scaled_centroid_x, scaled_centroid_y), # Descomenta si necesitas el centroide
+                'area_pixels': region.area # Área en la resolución del heatmap
             })
-            
-end_time_calc_strong_regions = time.time() # Fin del temporizador para el cálculo de regiones fuertes
-print(f"Tiempo de cálculo de regiones fuertes: {end_time_calc_strong_regions - start_time_calc_strong_regions:.4f} segundos")
-# Imprimir las regiones detectadas
-print(f"Shape de detected_strong_anomaly_regions: {len(detected_strong_anomaly_regions)}")
-print(f"Tipo de detected_strong_anomaly_regions: {type(detected_strong_anomaly_regions)}")
-print("\n--- Regiones Fuertes de Anomalía Detectadas (Vector Completo) ---")
-print(detected_strong_anomaly_regions)
-print("\n--- Regiones Fuertes de Anomalía Detectadas ---")
-for idx, region in enumerate(detected_strong_anomaly_regions):
-    print(f"Región {idx + 1}:")
-    print(f"  - Bounding Box (x, y, width, height): {region['bbox']}")
-    print(f"  - Área en píxeles: {region['area_pixels']}")
-    
-    
 
-# Plotting de regiones fuertes (con rectángulos)
-if len(detected_strong_anomaly_regions) > 0:
-    plt.figure(figsize=(10, 8))
-    plt.imshow(query_img_pil)
-    plt.title(f'Imagen de Consulta con Regiones Fuertes de Anomalía (Q-score: {q_score:.2f})')
-    plt.axis('off')
+    print(f"Se encontraron {len(detected_strong_anomaly_regions)} regiones de anomalía 'fuertes' (área >= {min_region_pixel_area} píxeles).")
+    if len(detected_strong_anomaly_regions) > 0:
+        print(f"Ejemplo de regiones fuertes (bbox): {detected_strong_anomaly_regions[0]['bbox']}")
+    else:
+        print("No se encontraron regiones fuertes de anomalía después de filtrar por área.")
 
-    ax = plt.gca() # Obtener el eje actual de matplotlib
-    for region_info in detected_strong_anomaly_regions:
-        bbox = region_info['bbox']
-        rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2], bbox[3],
-                                 linewidth=3, edgecolor='lime', facecolor='none',
-                                 linestyle='-', alpha=0.9) # Rectángulos verdes sólidos
-        ax.add_patch(rect)
-    
-    # Leyenda para los rectángulos
-    ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
-    plt.legend()
 
-    strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay_hole_000.png')
-    plt.tight_layout()
-    plt.savefig(strong_regions_overlay_output_filename)
-    plt.close()
+    # --- Visualización de las regiones fuertes de anomalía ---
+    if len(detected_strong_anomaly_regions) > 0:
+        plt.figure(figsize=(10, 8))
+        plt.imshow(query_img_pil)
+        plt.title(f'Imagen de Consulta con Regiones Fuertes de Anomalía (Q-score: {q_score:.2f})')
+        plt.axis('off')
 
-# --------------------------------------------------------------------------------------
-end_time_all_plotting = time.time()
-print(f"Tiempo total para procesar y dibujar las regiones: {end_time_all_plotting - start_time_all_plotting:.4f} segundos")
-# --------------------------------------------------------------------------------------
+        ax = plt.gca() # Obtener el eje actual de matplotlib
+        for i, region_info in enumerate(detected_strong_anomaly_regions):
+            bbox = region_info['bbox']
+            rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2], bbox[3],
+                                     linewidth=3, edgecolor='lime', facecolor='none',
+                                     linestyle='-', alpha=0.9) # Rectángulos verdes sólidos
+            ax.add_patch(rect)
+            # Opcional: Dibuja un punto en el centro de la región
+            # if 'centroid' in region_info:
+            #     plt.scatter(region_info['centroid'][0], region_info['centroid'][1],
+            #                 color='cyan', s=200, marker='X', linewidth=2, edgecolors='black', label='Centroide')
+
+        # Leyenda para los rectángulos
+        ax.add_patch(patches.Rectangle((0,0), 0.1, 0.1, linewidth=3, edgecolor='lime', facecolor='none', linestyle='-', alpha=0.9, label=f'Regiones Fuertes de Anomalía'))
+        plt.legend()
+
+
+        strong_regions_overlay_output_filename = os.path.join(plot_save_directory_on_server, 'strong_anomaly_regions_overlay.png')
+        plt.tight_layout()
+        plt.savefig(strong_regions_overlay_output_filename)
+        print(f"Plot de regiones fuertes de anomalía guardado en: {strong_regions_overlay_output_filename}")
+        plt.close()
+    else:
+        print("No se generó el plot de regiones fuertes de anomalía porque no se detectaron regiones válidas.")
+
+### AÑADIDO: FIN DEL BLOQUE DE DETECCIÓN DE REGIONES FUERTES DE ANOMALÍA ###
 
 
 
 
+end_time_point_heatmap = time.time()
+### AÑADIDO: FIN DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN REVISADA ###
+print(f"Tiempo para generar el heatmap de puntos: {end_time_point_heatmap - start_time_point_heatmap:.4f} segundos")
+### AÑADIDO: FIN DEL BLOQUE DE PUNTOS TOP ANÓMALOS Y VISUALIZACIÓN (CON ESCALADO) ###
 
 
 ##################################
@@ -1284,9 +842,7 @@ for i, similar_hr_feats in enumerate(similar_hr_feats_list):
 
 print("\nProceso de 'Object Feature Map' completado. ¡Ahora tienes los fobj_q y fobj_r listos!")
   
-
-
-# -----------3.5.2 Object matching module----------------------------------------------------------------
+# -----------3.5.2 Object matching module-----------------
 ## Matching
 # --- Definición de la función show_anomalies_on_image ---
 def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_path=None):
@@ -1327,12 +883,10 @@ def show_anomalies_on_image(image_np, masks, anomalous_info, alpha=0.5, save_pat
     plt.show()
     plt.close()
 # --- Fin de la definición de la función show_anomalies_on_image ---
-
-# --- Funciones de ploteo MODIFICADAS para la matriz P y P_augmented_full ---
+# --- Nuevas funciones de ploteo para la matriz P y P_augmented_full ---
 def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=None, title="Matriz de Asignación P"):
     """
-    Visualiza la matriz de asignación P como un mapa de calor y muestra los coeficientes
-    de confianza dentro de cada celda.
+    Visualiza la matriz de asignación P como un mapa de calor.
 
     Args:
         P_matrix (torch.Tensor or np.array): La matriz de asignación (M x N).
@@ -1342,9 +896,10 @@ def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=N
         title (str): Título del plot.
     """
     if isinstance(P_matrix, torch.Tensor):
+        #P_matrix = P_matrix.cpu().numpy()
         P_matrix = P_matrix.detach().cpu().numpy()
 
-    plt.figure(figsize=(P_matrix.shape[1] * 1.0 + 2, P_matrix.shape[0] * 1.0 + 2)) # Ajustado figsize
+    plt.figure(figsize=(P_matrix.shape[1] * 0.8 + 2, P_matrix.shape[0] * 0.8 + 2))
     plt.imshow(P_matrix, cmap='viridis', origin='upper', aspect='auto')
     plt.colorbar(label='Probabilidad de Asignación')
     plt.xticks(np.arange(len(reference_labels)), reference_labels, rotation=45, ha="right")
@@ -1352,18 +907,6 @@ def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=N
     plt.xlabel('Objetos de Referencia')
     plt.ylabel('Objetos de Consulta')
     plt.title(title)
-
-    # Añadir los valores de confianza dentro de cada celda
-    for i in range(P_matrix.shape[0]):
-        for j in range(P_matrix.shape[1]):
-            # Determinar el color del texto basado en el fondo (valor de la celda)
-            # Esto ayuda a la legibilidad: texto blanco sobre fondo oscuro, texto negro sobre fondo claro
-            text_color = 'white' if P_matrix[i, j] < 0.5 else 'black' 
-            plt.text(j, i, f'{P_matrix[i, j]:.3f}',
-                     ha="center", va="center", color=text_color, fontsize=8,
-                     weight='bold' if P_matrix[i, j] > 0.5 else 'normal') # Negrita para valores altos
-
-
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path)
@@ -1373,8 +916,7 @@ def plot_assignment_matrix(P_matrix, query_labels, reference_labels, save_path=N
 
 def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_labels, save_path=None, title="Matriz de Asignación Aumentada (con Trash Bin)"):
     """
-    Visualiza la matriz de asignación aumentada (incluyendo los trash bins) como un mapa de calor
-    y muestra los coeficientes de confianza dentro de cada celda.
+    Visualiza la matriz de asignación aumentada (incluyendo los trash bins) como un mapa de calor.
 
     Args:
         P_augmented_full (torch.Tensor or np.array): La matriz de asignación aumentada ((M+1) x (N+1)).
@@ -1384,13 +926,14 @@ def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_l
         title (str): Título del plot.
     """
     if isinstance(P_augmented_full, torch.Tensor):
+        #P_augmented_full = P_augmented_full.cpu().numpy()
         P_augmented_full = P_augmented_full.detach().cpu().numpy()
 
     # Añadir etiquetas para los trash bins
     full_query_labels = [f"Q_{i}" for i in query_labels] + ["Trash Bin (Q)"]
     full_reference_labels = [f"R_{i}" for i in reference_labels] + ["Trash Bin (R)"]
 
-    plt.figure(figsize=(P_augmented_full.shape[1] * 1.0 + 2, P_augmented_full.shape[0] * 1.0 + 2)) # Ajustado figsize
+    plt.figure(figsize=(P_augmented_full.shape[1] * 0.8 + 2, P_augmented_full.shape[0] * 0.8 + 2))
     plt.imshow(P_augmented_full, cmap='viridis', origin='upper', aspect='auto')
     plt.colorbar(label='Probabilidad de Asignación')
     plt.xticks(np.arange(len(full_reference_labels)), full_reference_labels, rotation=45, ha="right")
@@ -1398,16 +941,6 @@ def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_l
     plt.xlabel('Objetos de Referencia y Trash Bin')
     plt.ylabel('Objetos de Consulta y Trash Bin')
     plt.title(title)
-
-    # Añadir los valores de confianza dentro de cada celda
-    for i in range(P_augmented_full.shape[0]):
-        for j in range(P_augmented_full.shape[1]):
-            text_color = 'white' if P_augmented_full[i, j] < 0.5 else 'black'
-            plt.text(j, i, f'{P_augmented_full[i, j]:.3f}',
-                     ha="center", va="center", color=text_color, fontsize=8,
-                     weight='bold' if P_augmented_full[i, j] > 0.5 else 'normal')
-
-
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path)
@@ -1415,7 +948,7 @@ def plot_augmented_assignment_matrix(P_augmented_full, query_labels, reference_l
     plt.show()
     plt.close()
 
-# --- Fin de las funciones de ploteo MODIFICADAS ---
+# --- Fin de las nuevas funciones de ploteo ---
 
 ## Matching-continue---
 ## Matching
@@ -1442,15 +975,12 @@ def max_similarities(query_feats, candidate_feats):
 
 # --- Optimal Matching Module ---
 class ObjectMatchingModule(nn.Module):
-    def __init__(self, superglue_weights_path=None, sinkhorn_iterations=100, sinkhorn_epsilon=0.1, custom_z=None):
+    def __init__(self, superglue_weights_path=None, sinkhorn_iterations=100, sinkhorn_epsilon=0.1):
         super(ObjectMatchingModule, self).__init__()
         self.sinkhorn_iterations = sinkhorn_iterations
         self.sinkhorn_epsilon = sinkhorn_epsilon
 
-        if custom_z is not None: # Usar custom_z si se proporciona
-            self.z = nn.Parameter(torch.tensor(custom_z, dtype=torch.float32))
-            print(f"Parámetro 'z' inicializado con valor personalizado: {self.z.item():.4f}")
-        elif superglue_weights_path and os.path.exists(superglue_weights_path):
+        if superglue_weights_path and os.path.exists(superglue_weights_path):
             try:
                 state_dict = torch.load(superglue_weights_path, map_location=device)
                 if 'bin_score' in state_dict:
@@ -1460,6 +990,7 @@ class ObjectMatchingModule(nn.Module):
                 else:
                     print(f"Advertencia: 'z' (bin_score) no encontrado en {superglue_weights_path}. Inicializando con valor predeterminado.")
                     z_value = 0.5
+                                                #aqui puedes variar 0.5 por ej.
                 self.z = nn.Parameter(torch.tensor(z_value, dtype=torch.float32))
                 print(f"Parámetro 'z' cargado de SuperGlue: {self.z.item():.4f}")
 
@@ -1480,7 +1011,7 @@ class ObjectMatchingModule(nn.Module):
                    torch.empty(M+1, N+1, device=d_M_q.device)
 
         score_matrix = torch.mm(d_M_q, d_N_r.T)
-        # print(f"Matriz de similitud inicial (MxN): {score_matrix.shape}")
+        print(f"Matriz de similitud inicial (MxN): {score_matrix.shape}")
         # print("score_matrix:\n", score_matrix) # Descomentar para ver la matriz
 
         S_augmented = torch.zeros((M + 1, N + 1), device=d_M_q.device, dtype=d_M_q.dtype)
@@ -1488,36 +1019,33 @@ class ObjectMatchingModule(nn.Module):
         S_augmented[:M, N] = self.z # Última columna (trash bin para query)
         S_augmented[M, :N] = self.z # Última fila (trash bin para reference)
         S_augmented[M, N] = self.z # Esquina inferior derecha (trash bin vs trash bin)
-        # print(f"Matriz S_augmented (M+1 x N+1): {S_augmented.shape}")
+        print(f"Matriz S_augmented (M+1 x N+1): {S_augmented.shape}")
         # print("S_augmented:\n", S_augmented) # Descomentar para ver la matriz
 
         K = torch.exp(S_augmented / self.sinkhorn_epsilon)
-        print("K (exp(S/epsilon)) antes de Sinkhorn:\n", K) # Descomentar para ver
+        # print("K (exp(S/epsilon)) antes de Sinkhorn:\n", K) # Descomentar para ver
 
         for i in range(self.sinkhorn_iterations):
             K = K / K.sum(dim=1, keepdim=True) # Normalizar filas
             K = K / K.sum(dim=0, keepdim=True) # Normalizar columnas
-            print(f"K después de iteración {i+1} de Sinkhorn:\n", K) # Descomentar para ver cada iteración
+            # print(f"K después de iteración {i+1} de Sinkhorn:\n", K) # Descomentar para ver cada iteración
 
         P_augmented_full = K
         P = P_augmented_full[:M, :N] # La matriz de asignación sin trash bins
-        # print(f"Matriz de asignación P (MxN): {P.shape}")
-        # print("P:\n", P) # Print de la matriz de asignación P
-        # print(f"Matriz de asignación P_augmented_full (M+1 x N+1): {P_augmented_full.shape}")
-        # print("P_augmented_full:\n", P_augmented_full) # Print de la matriz de asignación completa
+        print(f"Matriz de asignación P (MxN): {P.shape}")
+        print("P:\n", P) # Print de la matriz de asignación P
+        print(f"Matriz de asignación P_augmented_full (M+1 x N+1): {P_augmented_full.shape}")
+        print("P_augmented_full:\n", P_augmented_full) # Print de la matriz de asignación completa
 
         return P, P_augmented_full
 
 # --- Uso del módulo de coincidencia ---
-superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"#
-# Para probar el ajuste de `self.z`, puedes pasar `custom_z` aquí:
-# Prueba con valores como 0.0, 0.1, 0.2, etc.
+superglue_weights_path = "/home/imercatoma/superglue_indoor.pth"
+
 object_matching_module = ObjectMatchingModule(
     superglue_weights_path=superglue_weights_path,
-    sinkhorn_iterations=30,  #100
-    sinkhorn_epsilon=0.1,
-    custom_z=0.9 #0.9 # <--- ¡Modifica este valor para tus pruebas! 1.5 a 4 funciona como 2.32 de superglue 1.1 ya varia 0.8
-    # bajar eleva el trash bin, subir lo baja [0.6 -- trashR 0.35] mal resultado
+    sinkhorn_iterations=100,
+    sinkhorn_epsilon=0.1
 ).to(device)
 
 
@@ -1553,7 +1081,7 @@ for i, d_N_r_current_image in enumerate(all_fobj_r_norm_list): # Cambié el nomb
 
 
 # --- Lógica de Detección de Anomalías ---
-# fobj_q_norm:(magnitud 1) normalizado a lo largo de una dim=1: en las columnas p=2: L2 distance
+# fobj_q_norm:(magnitud 1) normalizado a lo largo de una dim=1: en las columnas p=2: L2 distance 
 M = fobj_q_norm.shape[0]#devuelve el número de filas en el tensor que es el número de objetos de consulta total
 # la suma de sus cuadrados es 1.0; cada vector de características es escalado para que su norma L2 sea 1.0, vector unitario, valores individuales no restringidos a [0,1]
 is_matched_to_real_object = torch.zeros(M, dtype=torch.bool, device=device)
@@ -1579,9 +1107,9 @@ for P_current, P_augmented_current in zip(P_matrices, P_augmented_full_matrices)
         if max_conf_to_real_ref[q_idx] > best_match_confidence_overall[q_idx]: #actualizar al maximo global best match iterando
             best_match_confidence_overall[q_idx] = max_conf_to_real_ref[q_idx]
 
-        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]: #actualizar al maximo global bin
+        if conf_to_trash_bin_current[q_idx] > best_match_to_trash_bin_confidence[q_idx]: #actualizar al maximo global bin 
              best_match_to_trash_bin_confidence[q_idx] = conf_to_trash_bin_current[q_idx]
-                                        # anomaly_detection_threshold
+                                       # anomaly_detection_threshold
         if max_conf_to_real_ref[q_idx] > anomaly_detection_threshold and \
            max_conf_to_real_ref[q_idx] > conf_to_trash_bin_current[q_idx]:
             is_matched_to_real_object[q_idx] = True
@@ -1600,10 +1128,12 @@ for idx in range(M):
         print(f"Objeto {idx} asignado a un objeto real. Mejor similitud real: {best_match_confidence_overall[idx].item():.4f}, Confianza a trash bin: {best_match_to_trash_bin_confidence[idx].item():.4f}")
 
 
-output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_good_000.png')
+output_anomalies_query_plot_om = os.path.join(plot_save_directory_on_server, 'query_image_anomalies_optimal_crack_000.png') #########################################################################################
+###################                                                            ###########################################################################################################
 # Aquí también, pasamos la imagen original `image_for_sam_np`
 show_anomalies_on_image(image_for_sam_np, masks_data, anomalous_info, alpha=0.5, save_path=output_anomalies_query_plot_om)
 print(f"Plot de anomalías guardado en: {output_anomalies_query_plot_om}")
+
 
 
 
@@ -1620,10 +1150,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import time
-from scipy.cluster.hierarchy import dendrogram, linkage
-from scipy.spatial.distance import pdist
-import seaborn as sns
-from sklearn.cluster import KMeans
 
 # Asumiendo que 'device' y otras variables globales están definidas en tu script principal
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1926,7 +1452,7 @@ def plot_anomaly_map(anomaly_map_np, image_np, save_path=None, title="Mapa de An
 ref_pixel_distributions = build_reference_pixel_distributions(all_fobj_r_list, TARGET_MASK_H, TARGET_MASK_W)
 
 # 1.2. Create the full anomaly map, and now also separate matched/unmatched maps
-GLOBAL_ANOMALY_SCORE_CEILING = 30 # <--- ¡AJUSTA ESTE VALOR! Prueba con 20.0, 10.0, etc. eleva el valor de las confianzas e inmoviliza a trash
+GLOBAL_ANOMALY_SCORE_CEILING = 35.0 # <--- ¡AJUSTA ESTE VALOR! Prueba con 20.0, 10.0, etc.
 matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full_anomaly_map(
     M, masks_data, P_matrices, P_augmented_full_matrices,
     fobj_q, all_fobj_r_list,
@@ -1946,15 +1472,15 @@ matched_anomaly_map, unmatched_anomaly_map, full_query_anomaly_map = create_full
 )
 
 # 3. Plot the final anomaly map (General)
-output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_cut_000.png')
+output_full_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_full_crack_000.png')
 plot_anomaly_map(full_query_anomaly_map, image_for_sam_np, save_path=output_full_anomaly_map_filename, title="Mapa de Anomalías General")
 
 # 4. Plot the Matched Anomaly Map
-output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_cut_000.png')
+output_matched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_matched_crack_000.png')
 plot_anomaly_map(matched_anomaly_map, image_for_sam_np, save_path=output_matched_anomaly_map_filename, title="Mapa de Anomalías (Objetos Emparejados)")
 
 # 5. Plot the Unmatched Anomaly Map
-output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_cut_000.png')
+output_unmatched_anomaly_map_filename = os.path.join(plot_save_directory_on_server, 'final_anomaly_map_unmatched_crack_000.png')
 plot_anomaly_map(unmatched_anomaly_map, image_for_sam_np, save_path=output_unmatched_anomaly_map_filename, title="Mapa de Anomalías (Objetos No Emparejados)")
 
 print("--- Módulo de Medición de Anomalías (AMM) Completado ---")
@@ -1966,6 +1492,5 @@ total_execution_time = (end_time - start_time) + time_knn_dist + (end_time_sam -
 print(f"\nTiempo total de ejecución del script: {total_execution_time:.4f} segundos")
 
 print(f"Finalizado")
-
 
 
